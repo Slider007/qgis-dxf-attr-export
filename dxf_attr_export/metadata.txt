@@ -5,17 +5,18 @@ qgisMaximumVersion=4.99
 supportsQt6=True
 description=Выгрузка слоёв в DXF для AutoCAD со стилями, подписями и атрибутами объектов
 about=Кнопка на панели «Альтан-Эко» и пункт в меню «Модули → Альтан-Эко» открывают окно выгрузки в DXF. Оформление на выбор: полное, как на карте QGIS (цвета, толщины, заливки, значки), или только границы объектов — полилинии и точки. Подписи QGIS сохраняются. Каждый объект записывается блоком с атрибутами: значения всех полей видны в «Свойствах» AutoCAD и извлекаются в таблицу командой ИЗВЛЕЧЬДАННЫЕ (DATAEXTRACTION). Слой AutoCAD — имя слоя QGIS или значение выбранного поля. Координаты пишутся в выбранной системе координат без смещений, рядом кладётся файл .prj. Алгоритм доступен и в панели инструментов Processing.
-version=1.0.0
+version=1.0.1
 author=Slider007
 email=16690768+Slider007@users.noreply.github.com
 homepage=https://github.com/Slider007/qgis-dxf-attr-export
 repository=https://github.com/Slider007/qgis-dxf-attr-export
 tracker=https://github.com/Slider007/qgis-dxf-attr-export/issues
-tags=dxf,autocad,cad,export,attributes,block,экспорт,автокад,атрибуты,блок
+tags=Альтан,Altan,Альтан-Эко,dxf,autocad,cad,export,attributes,block,экспорт,автокад,атрибуты,блок
 category=Plugins
 icon=icon.svg
 experimental=False
 deprecated=False
 hasProcessingProvider=yes
 changelog=
+    1.0.1 - в теги модуля добавлено «Альтан»: теперь модули компании находятся поиском в менеджере модулей QGIS.
     1.0.0 - первая версия: выгрузка в DXF с подписями и атрибутами объектов в блоках; оформление на выбор — полное, как на карте, или только границы объектов.
