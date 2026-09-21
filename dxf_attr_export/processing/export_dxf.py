@@ -1,3 +1,4 @@
+import math
 import os
 
 from qgis.core import (
@@ -8,6 +9,7 @@ from qgis.core import (
     QgsFeatureRequest,
     QgsField,
     QgsGeometry,
+    QgsLineString,
     QgsMapSettings,
     QgsProcessingAlgorithm,
     QgsProcessingException,
@@ -19,6 +21,7 @@ from qgis.core import (
     QgsProcessingParameterScale,
     QgsReadWriteContext,
     QgsRectangle,
+    QgsPointXY,
     QgsRenderContext,
     QgsUnitTypes,
     QgsWkbTypes,
@@ -36,6 +39,19 @@ SYMBOLOGY_MODES = [
     Qgis.FeatureSymbologyExport.PerFeature,
     Qgis.FeatureSymbologyExport.PerSymbolLayer,
 ]
+# Заливки, которые QgsDxfExport в DXF не переносит вовсе (остаётся только контур).
+# Штриховку линиями модуль рисует сам, об остальных предупреждает.
+UNSUPPORTED_FILLS = {
+    "GradientFill": "градиент",
+    "ShapeburstFill": "заливка с размытием (shapeburst)",
+    "SVGFill": "SVG-заливка",
+    "RasterFill": "растровая заливка",
+    "PointPatternFill": "точечный узор",
+    "CentroidFill": "заливка по центроиду",
+    "RandomMarkerFill": "случайные значки",
+}
+MAX_HATCH_LINES = 5000  # защита от заливки с крошечным шагом на огромной площади
+
 # Коды единиц чертежа ($INSUNITS) для AutoCAD
 INSUNITS = {
     Qgis.DistanceUnit.Meters: 6,
@@ -83,6 +99,98 @@ def anchor_point(geom):
         return (v.x(), v.y())
     pt = p.asPoint()
     return (pt.x(), pt.y())
+
+
+def mm_to_map_units(value, unit, crs, scale):
+    """Размер символа в единицы карты: миллиметры и пункты — через масштаб."""
+    if unit == Qgis.RenderUnit.MapUnits:
+        return value
+    mm = value
+    if unit == Qgis.RenderUnit.Points:
+        mm = value * 25.4 / 72.0
+    elif unit == Qgis.RenderUnit.Inches:
+        mm = value * 25.4
+    elif unit == Qgis.RenderUnit.Pixels:
+        mm = value * 25.4 / 96.0
+    elif unit == Qgis.RenderUnit.MetersInMapUnits:
+        return value * QgsUnitTypes.fromUnitToUnitFactor(Qgis.DistanceUnit.Meters, crs.mapUnits())
+    return mm / 1000.0 * scale * QgsUnitTypes.fromUnitToUnitFactor(
+        Qgis.DistanceUnit.Meters, crs.mapUnits())
+
+
+def hatch_lines(geom, angle, spacing, offset=0.0):
+    """Линии штриховки внутри объекта: угол — как в QGIS (градусы по часовой от севера)."""
+    if spacing <= 0:
+        return None
+    box = geom.boundingBox()
+    if box.isEmpty():
+        return []
+    # угол линий в математическом виде (против часовой от востока)
+    a = math.radians(90.0 - angle)
+    dx, dy = math.cos(a), math.sin(a)
+    nx, ny = -dy, dx  # поперёк линий
+    cx, cy = box.center().x(), box.center().y()
+    reach = math.hypot(box.width(), box.height()) / 2.0 + spacing
+    steps = int(reach / spacing) + 1
+    if steps * 2 + 1 > MAX_HATCH_LINES:
+        return None
+    out = []
+    for k in range(-steps, steps + 1):
+        shift = k * spacing + offset
+        x0, y0 = cx + nx * shift - dx * reach, cy + ny * shift - dy * reach
+        x1, y1 = cx + nx * shift + dx * reach, cy + ny * shift + dy * reach
+        line = QgsGeometry(QgsLineString([QgsPointXY(x0, y0), QgsPointXY(x1, y1)]))
+        piece = geom.intersection(line)
+        if piece.isNull() or piece.isEmpty():
+            continue
+        parts = piece.asGeometryCollection() if piece.isMultipart() else [piece]
+        for part in parts:
+            if part.type() != Qgis.GeometryType.Line:
+                continue
+            pts = [(p.x(), p.y()) for p in part.asPolyline()]
+            if len(pts) > 1:
+                out.append(pts)
+    return out
+
+
+def pattern_fills(symbol):
+    """Штриховки линиями и не переносимые заливки символа: ([(угол, шаг, единица, смещение, цвет)], [типы])."""
+    hatches, missing = [], []
+    if symbol is None or symbol.type() != Qgis.SymbolType.Fill:
+        return hatches, missing
+    for i in range(symbol.symbolLayerCount()):
+        sl = symbol.symbolLayer(i)
+        if not sl.enabled():
+            continue
+        kind = sl.layerType()
+        if kind == "LinePatternFill":
+            color = sl.color()
+            line = sl.subSymbol()
+            if line is not None and line.color().isValid():
+                color = line.color()
+            hatches.append((sl.lineAngle(), sl.distance(), sl.distanceUnit(), sl.offset(),
+                            (color.red(), color.green(), color.blue())))
+        elif kind in UNSUPPORTED_FILLS:
+            missing.append(UNSUPPORTED_FILLS[kind])
+    return hatches, missing
+
+
+def polygon_rings(geom):
+    """Контуры полигона: [(точки, внешний ли контур)] — для границ и штриховки."""
+    g = QgsGeometry(geom)
+    if QgsWkbTypes.isCurvedType(g.wkbType()):
+        g.convertToStraightSegment()
+    if g.type() != Qgis.GeometryType.Polygon:
+        return []
+    rings = []
+    for poly in (g.asMultiPolygon() if g.isMultipart() else [g.asPolygon()]):
+        for n, ring in enumerate(poly):
+            pts = [(p.x(), p.y()) for p in ring]
+            if len(pts) > 1 and pts[0] == pts[-1]:
+                pts.pop()
+            if len(pts) > 2:
+                rings.append((pts, n == 0))
+    return rings
 
 
 def outline_shapes(geom):
@@ -135,6 +243,8 @@ def outline_color(symbol):
 class ExportDxfAlgorithm(QgsProcessingAlgorithm):
     LAYERS = "LAYERS"
     BLOCK_CONTENT = "BLOCK_CONTENT"
+    PATTERN_FILLS = "PATTERN_FILLS"
+    HATCH_LINES, HATCH_NATIVE, HATCH_NONE = 0, 1, 2
     SYMBOLOGY_MODE = "SYMBOLOGY_MODE"
     SYMBOLOGY_SCALE = "SYMBOLOGY_SCALE"
     ENCODING = "ENCODING"
@@ -171,6 +281,9 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
             "а каждый объект записывается блоком с атрибутами: значения всех полей "
             "видны в «Свойствах» AutoCAD и извлекаются командой ИЗВЛЕЧЬДАННЫЕ "
             "(DATAEXTRACTION).\n\n"
+            "Штриховку линиями QGIS в DXF не переносит. Модуль переносит её сам: "
+            "линиями внутри контура объекта или штриховкой AutoCAD (одним объектом на "
+            "контур — файл получается намного меньше).\n\n"
             "Оформление в блоках: полное (как на карте QGIS: заливки, значки, толщины) "
             "или только границы — полигоны замкнутыми полилиниями по каждому контуру, "
             "линии полилиниями, точки точками AutoCAD, цветом обводки символа.\n\n"
@@ -189,15 +302,22 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
              self.tr("Только границы объектов (полилинии и точки)")],
             defaultValue=0))
         self.addParameter(QgsProcessingParameterEnum(
+            self.PATTERN_FILLS, self.tr("Штриховка линиями (QGIS её не переносит)"),
+            [self.tr("Линиями — надёжно, файл крупнее"),
+             self.tr("Штриховкой AutoCAD — компактно"),
+             self.tr("Не переносить")],
+            defaultValue=0))
+        self.addParameter(QgsProcessingParameterEnum(
             self.SYMBOLOGY_MODE, self.tr("Перенос стилей"),
             [self.tr("Без стилей"), self.tr("Стили объектов"), self.tr("Стили слоёв символов")],
             defaultValue=1))
         self.addParameter(QgsProcessingParameterScale(
             self.SYMBOLOGY_SCALE, self.tr("Масштаб для стилей и подписей"), defaultValue=1000))
         encodings = QgsDxfExport.encodings()
+        # в QGIS 4 список записан в нижнем регистре («cp1251»), поэтому без учёта регистра
+        default = next((i for i, e in enumerate(encodings) if e.lower() == "cp1251"), 0)
         self.addParameter(QgsProcessingParameterEnum(
-            self.ENCODING, self.tr("Кодировка"), encodings,
-            defaultValue=encodings.index("CP1251") if "CP1251" in encodings else 0))
+            self.ENCODING, self.tr("Кодировка"), encodings, defaultValue=default))
         self.addParameter(QgsProcessingParameterCrs(
             self.CRS, self.tr("Система координат"), defaultValue="ProjectCrs"))
         self.addParameter(QgsProcessingParameterBoolean(
@@ -287,6 +407,10 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
         mtext = self.parameterAsBoolean(parameters, self.MTEXT, context)
         visible = self.parameterAsBoolean(parameters, self.ATTRIBUTES_VISIBLE, context)
         outlines = self.parameterAsEnum(parameters, self.BLOCK_CONTENT, context) == 1
+        hatch_mode = self.parameterAsEnum(parameters, self.PATTERN_FILLS, context)
+        do_hatch = hatch_mode != self.HATCH_NONE and not outlines
+        missing_fills = {}
+        too_dense = 0
         write_prj = self.parameterAsBoolean(parameters, self.WRITE_PRJ, context)
         path = self.parameterAsFileOutput(parameters, self.OUTPUT, context)
         if not path:
@@ -301,7 +425,7 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
             transform = QgsCoordinateTransform(copy.crs(), crs, context.transformContext())
             feats = {f.id(): f for f in copy.getFeatures()}
             renderer = None
-            if outlines and copy.renderer() is not None:
+            if (outlines or do_hatch) and copy.renderer() is not None:
                 rctx = QgsRenderContext()
                 rctx.setRendererScale(scale)
                 rctx.expressionContext().appendScopes(
@@ -322,14 +446,34 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
                                 copy.name(), crs.authid(), e))
                     fb.anchor = anchor_point(geom)
                     extent.combineExtentWith(geom.boundingBox())
+                    symbol = None
+                    if renderer is not None:
+                        rctx.expressionContext().setFeature(feat)
+                        if renderer.willRenderFeature(feat, rctx):
+                            symbol = renderer.symbolForFeature(feat, rctx)
                     if outlines:
-                        fb.shapes, fb.color = outline_shapes(geom), None
-                        if renderer is not None:
-                            rctx.expressionContext().setFeature(feat)
-                            if renderer.willRenderFeature(feat, rctx):
-                                fb.color = outline_color(renderer.symbolForFeature(feat, rctx))
-                            else:  # скрыт стилем слоя, как и в полном оформлении
-                                fb.shapes = []
+                        fb.shapes = outline_shapes(geom) if symbol is not None else []
+                        fb.color = outline_color(symbol)
+                    elif do_hatch and symbol is not None:
+                        hatches, missing = pattern_fills(symbol)
+                        for name in missing:
+                            missing_fills[name] = missing_fills.get(name, 0) + 1
+                        for angle, distance, unit, shift, color in hatches:
+                            spacing = mm_to_map_units(distance, unit, crs, scale)
+                            if spacing <= 0:
+                                continue
+                            if hatch_mode == self.HATCH_NATIVE:
+                                rings = polygon_rings(geom)
+                                if rings:
+                                    fb.hatches.append(
+                                        (color, (90.0 - angle) % 180.0, spacing, rings))
+                                continue
+                            lines = hatch_lines(geom, angle, spacing,
+                                                mm_to_map_units(shift, unit, crs, scale))
+                            if lines is None:
+                                too_dense += 1
+                                continue
+                            fb.extra += [("LINE", pts, False, color) for pts in lines]
                 done += 1
                 feedback.setProgress(20.0 * done / total)
             if renderer is not None:
@@ -385,6 +529,14 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
                 f.write(crs.toWkt(Qgis.CrsWktVariant.Wkt1Esri))
 
         feedback.pushInfo(self.tr("Объектов записано блоками с атрибутами: {}").format(result.blocks))
+        for name, count in sorted(missing_fills.items()):
+            feedback.reportError(self.tr(
+                "Заливка «{}» в DXF не переносится (объектов: {}) — остаётся только контур").format(
+                    name, count))
+        if too_dense:
+            feedback.reportError(self.tr(
+                "У {} объектов шаг штриховки слишком мелкий для их площади — штриховка пропущена").format(
+                    too_dense))
         if result.without_geometry:
             feedback.reportError(self.tr(
                 "Объектов без геометрии или не попавших в DXF: {} — они не выгружены").format(

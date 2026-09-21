@@ -28,6 +28,7 @@ QCoreApplication.setApplicationName("dxf-attr-export-tests")
 
 from osgeo import ogr  # noqa: E402
 from qgis.core import (  # noqa: E402
+    Qgis,
     QgsApplication,
     QgsCategorizedSymbolRenderer,
     QgsDxfExport,
@@ -35,6 +36,8 @@ from qgis.core import (  # noqa: E402
     QgsCoordinateTransformContext,
     QgsFillSymbol,
     QgsGeometry,
+    QgsGradientFillSymbolLayer,
+    QgsLinePatternFillSymbolLayer,
     QgsMarkerSymbol,
     QgsPalLayerSettings,
     QgsProcessingFeedback,
@@ -59,7 +62,10 @@ app.initQgis()
 QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, PROFILE)
 assert QSettings().fileName().startswith(PROFILE), QSettings().fileName()
 
-sys.path.append(os.path.join(os.environ.get("QGIS_PREFIX_PATH", ""), "..", "Resources", "python", "plugins"))
+# папка со встроенными модулями QGIS (там лежит processing) — рядом с python QGIS
+for _p in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+    if os.path.isdir(os.path.join(_p, "plugins")):
+        sys.path.append(os.path.join(_p, "plugins"))
 from processing.core.Processing import Processing  # noqa: E402
 
 Processing.initialize()
@@ -78,9 +84,22 @@ LONG = "длинное значение " * 20  # 340 символов
 
 # ---------- чтение DXF без кода модуля
 
-def read_pairs(path, encoding="cp1251"):
+CODEPAGES = {"ANSI_1251": "cp1251", "ANSI_1252": "cp1252", "ANSI_1250": "cp1250"}
+
+
+def dxf_encoding(data):
+    """Как кодировку определяет читатель DXF: по $ACADVER и $DWGCODEPAGE."""
+    lines = [ln.strip() for ln in data[:8192].decode("latin-1").split("\n")]
+    version = lines[lines.index("$ACADVER") + 2]
+    if version >= "AC1021":  # R2007 и новее всегда UTF-8
+        return "utf-8"
+    return CODEPAGES.get(lines[lines.index("$DWGCODEPAGE") + 2], "cp1251")
+
+
+def read_pairs(path, encoding=None):
     with open(path, "rb") as f:
-        lines = f.read().decode(encoding).split("\n")
+        data = f.read()
+    lines = data.decode(encoding or dxf_encoding(data)).split("\n")
     lines = [ln.rstrip("\r") for ln in lines]
     if lines[-1] == "":
         lines.pop()
@@ -236,6 +255,19 @@ class ExportTest(unittest.TestCase):
         t = ((seg1 + seg2) / 2 - seg1) / seg2
         self.assertAlmostEqual(x, 400100 + 200 * t, places=6)
         self.assertAlmostEqual(y, 6000050 - 50 * t, places=6)
+
+    def test_text_encoding_matches_header(self):
+        """Кириллица записана той кодировкой, которую объявляет сам файл.
+
+        QGIS 4 пишет UTF-8 при заголовке ANSI_1251 — модуль это исправляет.
+        """
+        with open(self.path, "rb") as f:
+            data = f.read()
+        codec = dxf_encoding(data)
+        self.assertEqual(codec, "cp1251")
+        self.assertIn("Опора №1".encode(codec), data)
+        self.assertNotIn("Опора №1".encode("utf-8"), data)
+        data.decode(codec)  # файл целиком читается этой кодировкой
 
     def test_no_temporary_names_left(self):
         with open(self.path, "rb") as f:
@@ -448,6 +480,137 @@ class OutlineTest(unittest.TestCase):
         kinds = [e["type"] for e in entities(section(read_pairs(path), "BLOCKS"))]
         self.assertIn("HATCH", kinds)
         self.assertNotIn("LWPOLYLINE", kinds, "обводки у символа нет")
+
+
+class PatternFillTest(unittest.TestCase):
+    """Штриховку линиями QGIS в DXF не переносит — модуль рисует её сам."""
+
+    ANGLE = 135.0   # градусы по часовой от севера, как в QGIS
+    STEP_MM = 3.75  # шаг в миллиметрах; при масштабе 1:1000 это 3.75 м
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plugin = DxfAttrExportPlugin(None)
+        cls.plugin.initProcessing()
+        cls.polys = make_layer(
+            "Polygon", "Зоны", "field=name:string",
+            [("POLYGON((400000 6000000, 400100 6000000, 400100 6000100, 400000 6000100, 400000 6000000))",
+              ["Зона 1"])])
+        symbol = QgsFillSymbol()
+        hatch = QgsLinePatternFillSymbolLayer()
+        hatch.setLineAngle(cls.ANGLE)
+        hatch.setDistance(cls.STEP_MM)
+        hatch.setDistanceUnit(Qgis.RenderUnit.Millimeters)
+        hatch.setColor(QColor(183, 72, 75))
+        symbol.changeSymbolLayer(0, hatch)
+        cls.polys.renderer().setSymbol(symbol)
+        QgsProject.instance().addMapLayer(cls.polys)
+        cls.path = os.path.join(OUT, "hatch.dxf")
+        processing.run(ALG, {"LAYERS": layers_param((cls.polys, -1)), "CRS": CRS,
+                            "SYMBOLOGY_SCALE": 1000, "OUTPUT": cls.path})
+
+    @classmethod
+    def tearDownClass(cls):
+        QgsApplication.processingRegistry().removeProvider(cls.plugin.provider)
+        QgsProject.instance().removeAllMapLayers()
+
+    def hatch_lines(self, path):
+        out = []
+        for e in entities(section(read_pairs(path), "BLOCKS")):
+            if e["type"] != "LWPOLYLINE" or int(e["70"]) != 0:
+                continue
+            xs = [float(v) for c, v in e["tags"] if c == "10"]
+            ys = [float(v) for c, v in e["tags"] if c == "20"]
+            if len(xs) == 2:
+                out.append((list(zip(xs, ys)), int(e["420"])))
+        return out
+
+    def test_lines_drawn(self):
+        lines = self.hatch_lines(self.path)
+        # квадрат 100×100 м, шаг 3.75 м по нормали: диагональных линий около 37
+        self.assertGreater(len(lines), 30)
+        self.assertLess(len(lines), 45)
+        self.assertEqual({rgb for _, rgb in lines}, {(183 << 16) | (72 << 8) | 75}, "цвет штриховки")
+
+    def test_angle_and_step(self):
+        import math
+        lines = self.hatch_lines(self.path)
+        for pts, _ in lines:
+            (x0, y0), (x1, y1) = pts
+            angle = math.degrees(math.atan2(y1 - y0, x1 - x0)) % 180
+            self.assertAlmostEqual(angle, (90 - self.ANGLE) % 180, places=6, msg="угол линий")
+        # расстояние между соседними линиями по нормали
+        a = math.radians(90 - self.ANGLE)
+        nx, ny = -math.sin(a), math.cos(a)
+        offsets = sorted(pts[0][0] * nx + pts[0][1] * ny for pts, _ in lines)
+        steps = [round(b - a2, 6) for a2, b in zip(offsets, offsets[1:])]
+        self.assertEqual(set(steps), {3.75}, "шаг 3.75 мм при 1:1000 = 3.75 м")
+
+    def test_lines_inside_polygon(self):
+        lines = self.hatch_lines(self.path)
+        for pts, _ in lines:
+            for x, y in pts:
+                self.assertTrue(399999.9 <= x <= 400100.1 and 5999999.9 <= y <= 6000100.1, (x, y))
+
+    def test_can_be_switched_off(self):
+        path = os.path.join(OUT, "hatch_off.dxf")
+        processing.run(ALG, {"LAYERS": layers_param((self.polys, -1)), "CRS": CRS,
+                            "SYMBOLOGY_SCALE": 1000, "PATTERN_FILLS": 2, "OUTPUT": path})
+        self.assertEqual(self.hatch_lines(path), [])
+
+    def test_native_hatch(self):
+        """Штриховка AutoCAD: один объект на объект карты, узор задан в файле."""
+        path = os.path.join(OUT, "hatch_native.dxf")
+        processing.run(ALG, {"LAYERS": layers_param((self.polys, -1)), "CRS": CRS,
+                            "SYMBOLOGY_SCALE": 1000, "PATTERN_FILLS": 1, "OUTPUT": path})
+        hatches = [e for e in entities(section(read_pairs(path), "BLOCKS")) if e["type"] == "HATCH"]
+        self.assertEqual(len(hatches), 1)
+        h = hatches[0]
+        self.assertEqual(h["2"], "_USER", "узор описан в файле, а не взят из acad.pat")
+        self.assertEqual(int(h["70"]), 0, "не сплошная заливка")
+        self.assertEqual(int(h["76"]), 0, "узор задан пользователем")
+        self.assertAlmostEqual(float(h["53"]), (90 - self.ANGLE) % 180, places=6)
+        self.assertAlmostEqual(float(h["46"]), 3.75, places=6)
+        self.assertEqual(int(h["420"]), (183 << 16) | (72 << 8) | 75)
+        # контур объекта: 4 точки квадрата
+        self.assertEqual(int(h["91"]), 1)
+        self.assertEqual(int(h["93"]), 4)
+        # вместо десятков линий — один объект (на больших контурах это решает размер файла)
+        self.assertEqual(self.hatch_lines(path), [])
+        self.assertGreater(len(self.hatch_lines(self.path)), 30)
+
+    def test_native_hatch_keeps_holes(self):
+        layer = make_layer(
+            "Polygon", "С дыркой", "field=name:string",
+            [("POLYGON((400000 6000000, 400100 6000000, 400100 6000100, 400000 6000100, 400000 6000000),"
+              "(400020 6000020, 400040 6000020, 400040 6000040, 400020 6000040, 400020 6000020))",
+              ["дырка"])])
+        layer.renderer().setSymbol(self.polys.renderer().symbol().clone())
+        QgsProject.instance().addMapLayer(layer)
+        path = os.path.join(OUT, "hatch_hole.dxf")
+        processing.run(ALG, {"LAYERS": layers_param((layer, -1)), "CRS": CRS,
+                            "SYMBOLOGY_SCALE": 1000, "PATTERN_FILLS": 1, "OUTPUT": path})
+        h = next(e for e in entities(section(read_pairs(path), "BLOCKS")) if e["type"] == "HATCH")
+        self.assertEqual(int(h["91"]), 2, "внешний контур и дырка")
+        flags = [int(v) for c, v in h["tags"] if c == "92"]
+        self.assertEqual(flags, [3, 2], "первый контур внешний, второй — дырка")
+
+    def test_unsupported_fill_warns(self):
+        layer = make_layer("Polygon", "Градиент", "field=name:string",
+                           [("POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))", ["g"])])
+        symbol = QgsFillSymbol()
+        symbol.changeSymbolLayer(0, QgsGradientFillSymbolLayer(QColor(255, 0, 0), QColor(0, 0, 255)))
+        layer.renderer().setSymbol(symbol)
+        QgsProject.instance().addMapLayer(layer)
+        errors = []
+
+        class Feedback(QgsProcessingFeedback):
+            def reportError(self, error, fatalError=False):
+                errors.append(error)
+
+        processing.run(ALG, {"LAYERS": layers_param((layer, -1)), "CRS": CRS,
+                            "OUTPUT": os.path.join(OUT, "gradient.dxf")}, feedback=Feedback())
+        self.assertTrue(any("градиент" in e for e in errors), errors)
 
 
 class HelpersTest(unittest.TestCase):

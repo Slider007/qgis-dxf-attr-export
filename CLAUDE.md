@@ -32,6 +32,18 @@
 
 ## Грабли
 
+- **Кодировка.** QGIS 3 пишет байты в выбранной кодировке (заголовок
+  $DWGCODEPAGE ей соответствует), QGIS 4 при том же заголовке пишет UTF-8 —
+  читатели DXF показывают такой файл кракозябрами. `dxf_blocks.read_codec`
+  распознаёт файл по содержимому, а записывает всегда в объявленной кодировке,
+  то есть попутно исправляет файл QGIS 4. В QGIS 4 список `QgsDxfExport.encodings()`
+  в нижнем регистре («cp1251»), поиск кодировки — без учёта регистра.
+- **Версия DXF.** 3.40 пишет AC1015, 3.44 и 4.2 — AC1018. По версии кодировку
+  определять нельзя (см. выше).
+- `QgsDxfExport` переносит в DXF только «Простую заливку»: остальные заливки
+  дают лишь контур. Штриховку линиями модуль рисует сам (`hatch_lines` —
+  линиями, `_hatch_entities` — штриховкой AutoCAD `_USER` с узором в самом файле).
+
 - Папка плагина `dxf_attr_export` — это id у пользователей, не менять.
 - `QgsDxfExport` сам пропускает подпись, если в ней есть символ вне кодировки.
 - `QgsMapLayer.title()` в 3.40 устарел: заголовок — `serverProperties().title()`.
@@ -41,6 +53,9 @@
   во временном venv вне QGIS; в модуль `ezdxf` не входит.
 - Кнопка, пункт меню и панель — общие «Альтан-Эко»: `altan_toolbar.py` и
   `altan_logo.svg` копируются из `~/Projects/QGIS/shared/` без изменений.
+- Сборки 3.44+ и 4.x устроены иначе: python в `Contents/MacOS/python3.12`,
+  нужен `PYTHONHOME=Contents/Frameworks`, python QGIS в `Contents/Resources/qgis/python`.
+  `tests/run_tests.sh` это учитывает; другая версия — `QGIS_APP=…`.
 - Проверка в настоящем QGIS: `QGIS --profiles-path <tmp> --code check.py`, плагин
   включается в `<tmp>/profiles/default/qgis.org/QGIS3.ini`. Окно алгоритма модальное:
   закрывать его таймером, найдя через `QApplication.activeModalWidget()`.

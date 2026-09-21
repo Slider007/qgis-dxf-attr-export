@@ -35,6 +35,12 @@ class FeatureBlock:
         # [("POINT", [(x, y)], False) | ("LINE", [(x, y), …], замкнута)]; None — оформление QGIS
         self.shapes = shapes
         self.color = color  # (r, g, b) для shapes; None — цвет слоя
+        # Фигуры, которые дописываются в блок поверх остального (линии штриховки):
+        # [(вид, точки, замкнута, (r, g, b))]
+        self.extra = []
+        # Штриховки AutoCAD: [((r, g, b), угол в градусах от оси X, шаг,
+        # [(точки контура, внешний ли контур)])]
+        self.hatches = []
 
 
 class ExportLayer:
@@ -72,6 +78,23 @@ def attribute_tags(names):
         seen.add(tag)
         tags.append(tag)
     return tags
+
+
+def read_codec(data, encoding):
+    """Кодировка, которой файл записан на самом деле.
+
+    QGIS 3 пишет байты в выбранной кодировке, как и указано в заголовке
+    $DWGCODEPAGE. QGIS 4 (Qt6) при том же заголовке пишет UTF-8 — такой файл
+    читатели DXF показывают кракозябрами. Файл распознаётся по содержимому,
+    а записывается обратно уже в объявленной кодировке.
+    """
+    if not data.isascii():
+        try:
+            data.decode("utf-8")
+            return "utf-8"
+        except UnicodeDecodeError:
+            pass
+    return python_codec(encoding)
 
 
 def python_codec(encoding):
@@ -211,6 +234,58 @@ def _table(tables, name):
     raise ValueError("В DXF нет таблицы " + name)
 
 
+def _shape_entities(doc, rec_h, lname, items, default_color=None):
+    """Фигуры (точки и полилинии) как сущности DXF: [(вид, точки, замкнута[, цвет])]."""
+    out = []
+    for item in items:
+        kind, points, closed = item[0], item[1], item[2]
+        rgb = item[3] if len(item) > 3 else default_color
+        head = [("5", doc.handle()), ("330", rec_h), ("100", "AcDbEntity"), ("8", lname)]
+        if rgb:
+            head.append(("420", "{:>9}".format((rgb[0] << 16) | (rgb[1] << 8) | rgb[2])))
+        if kind == "POINT":
+            out.append(_Entity([("0", "POINT")] + head + [
+                ("100", "AcDbPoint"), ("10", _fmt(points[0][0])), ("20", _fmt(points[0][1])),
+                ("30", "0.0")]))
+        else:
+            tags = [("0", "LWPOLYLINE")] + head + [
+                ("100", "AcDbPolyline"), ("90", "{:>6}".format(len(points))),
+                ("70", "     1" if closed else "     0"), ("43", "0.0")]
+            for px, py in points:
+                tags += [("10", _fmt(px)), ("20", _fmt(py))]
+            out.append(_Entity(tags))
+    return out
+
+
+def _hatch_entities(doc, rec_h, lname, hatches):
+    """Штриховка AutoCAD: узор задан в самом файле (одна линия под углом с шагом)."""
+    out = []
+    for rgb, angle, spacing, rings in hatches:
+        rings = [r for r in rings if len(r[0]) > 2]
+        if not rings or spacing <= 0:
+            continue
+        tags = [("0", "HATCH"), ("5", doc.handle()), ("330", rec_h), ("100", "AcDbEntity"),
+                ("8", lname)]
+        if rgb:
+            tags.append(("420", "{:>9}".format((rgb[0] << 16) | (rgb[1] << 8) | rgb[2])))
+        tags += [("100", "AcDbHatch"), ("10", "0.0"), ("20", "0.0"), ("30", "0.0"),
+                 ("210", "0.0"), ("220", "0.0"), ("230", "1.0"),
+                 ("2", "_USER"),  # узор не из acad.pat, а описан ниже
+                 ("70", "     0"), ("71", "     0"), ("91", "{:>6}".format(len(rings)))]
+        for points, external in rings:
+            tags += [("92", "     3" if external else "     2"), ("72", "     0"),
+                     ("73", "     1"), ("93", "{:>6}".format(len(points)))]
+            for px, py in points:
+                tags += [("10", _fmt(px)), ("20", _fmt(py))]
+            tags.append(("97", "     0"))
+        tags += [("75", "     0"), ("76", "     0"), ("52", "0.0"), ("41", "1.0"),
+                 ("77", "     0"), ("78", "     1"),
+                 ("53", _fmt(angle)), ("43", "0.0"), ("44", "0.0"),
+                 ("45", "0.0"), ("46", _fmt(spacing)), ("79", "     0"), ("98", "     0")]
+        out.append(_Entity(tags))
+    return out
+
+
 def _encoder(codec):
     def enc(s):
         out = []
@@ -242,10 +317,11 @@ def add_attribute_blocks(path, encoding, layers, text_height=2.5, visible=False,
     `layers` — список ExportLayer; `insunits` — код единиц чертежа AutoCAD
     ($INSUNITS: 6 — метры). Возвращает Result.
     """
-    codec = python_codec(encoding)
-    enc = _encoder(codec)
     with open(path, "rb") as f:
-        doc = _Doc(f.read().decode(codec, errors="replace"))
+        data = f.read()
+    codec = python_codec(encoding)  # в этой кодировке файл будет записан
+    enc = _encoder(codec)
+    doc = _Doc(data.decode(read_codec(data, encoding), errors="replace"))
     result = Result()
 
     by_key = {}
@@ -335,7 +411,7 @@ def add_attribute_blocks(path, encoding, layers, text_height=2.5, visible=False,
         tags = attribute_tags(n for n, _ in lay.fields)
         for fb in lay.features:
             content = geometry.get(fb.key) if fb.shapes is None else fb.shapes
-            if not content or fb.anchor is None:
+            if not (content or fb.extra or fb.hatches) or fb.anchor is None:
                 result.without_geometry += 1
                 continue
             if fb.key not in first_pos:  # QGIS не нарисовал объект, а границы есть
@@ -373,26 +449,13 @@ def add_attribute_blocks(path, encoding, layers, text_height=2.5, visible=False,
                     ("40", _fmt(text_height)), ("1", ""), ("100", "AcDbAttributeDefinition"),
                     ("3", enc(text_value(prompt))), ("2", enc(tag)), ("70", flags)]))
             if fb.shapes is None:
-                for unit in content:
+                for unit in (content or []):
                     unit[0].set("330", rec_h, after="5")
                     body += unit
             else:
-                color = [("420", "{:>9}".format((fb.color[0] << 16) | (fb.color[1] << 8) | fb.color[2]))
-                         ] if fb.color else []
-                for kind, points, closed in content:
-                    head = [("5", doc.handle()), ("330", rec_h), ("100", "AcDbEntity"),
-                            ("8", lname)] + color
-                    if kind == "POINT":
-                        body.append(_Entity([("0", "POINT")] + head + [
-                            ("100", "AcDbPoint"), ("10", _fmt(points[0][0])),
-                            ("20", _fmt(points[0][1])), ("30", "0.0")]))
-                    else:
-                        ptags = [("0", "LWPOLYLINE")] + head + [
-                            ("100", "AcDbPolyline"), ("90", "{:>6}".format(len(points))),
-                            ("70", "     1" if closed else "     0"), ("43", "0.0")]
-                        for px, py in points:
-                            ptags += [("10", _fmt(px)), ("20", _fmt(py))]
-                        body.append(_Entity(ptags))
+                body += _shape_entities(doc, rec_h, lname, content, fb.color)
+            body += _hatch_entities(doc, rec_h, lname, fb.hatches)
+            body += _shape_entities(doc, rec_h, lname, fb.extra, fb.color)
             body.append(_Entity([
                 ("0", "ENDBLK"), ("5", doc.handle()), ("330", rec_h), ("100", "AcDbEntity"),
                 ("8", lname), ("100", "AcDbBlockEnd")]))
