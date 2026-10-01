@@ -61,6 +61,13 @@ BLOCK_MODES = [
 ENCODINGS = ["Определить по файлу", "CP1251", "UTF-8", "CP866", "KOI8-R"]
 AUTO_ENCODING = 0
 
+# Справочники СК, коды которых понимает GDAL. Пользовательская СК QGIS
+# («USER:100000», такой бывает МСК) среди них нет: её GDAL принимает только описанием.
+AUTHORITIES = ("EPSG:", "ESRI:", "IGNF:", "OGC:", "IAU_2015:")
+
+# Бесплатный переводчик DWG → DXF (GNU, годится и для коммерческой работы)
+LIBREDWG_SITE = "https://www.gnu.org/software/libredwg/"
+
 # Виды геометрии: они же суффиксы в именах слоёв
 POINT, LINE, POLYGON = "точки", "линии", "полигоны"
 
@@ -282,8 +289,12 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             "каждый слой чертежа и вид геометрии, в выбранной системе координат.\n\n"
             "Атрибуты блоков становятся полями таблицы, подписи привязываются к полигонам, "
             "внутрь которых попали, замкнутые полилинии читаются полигонами.\n\n"
-            "DWG не читается — его нужно сохранить в AutoCAD как DXF."
-        )
+            "<b>DWG не читается.</b> Сохраните чертёж в AutoCAD как DXF, либо переведите "
+            "бесплатной программой LibreDWG (<a href=\"{url}\">{url}</a>) командой "
+            "«dwg2dxf -o чертёж.dxf чертёж.dwg» — модуль её не вызывает, перевод делается "
+            "вручную. Встроенное окно QGIS «Проект → Импорт/Экспорт → Импорт слоёв из "
+            "DWG/DXF» читает DWG само, но без атрибутов блоков."
+        ).format(url=LIBREDWG_SITE)
 
     def initAlgorithm(self, config=None):
         add(self, QgsProcessingParameterFile(
@@ -342,12 +353,12 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             from osgeo import gdal, ogr, osr  # входят в состав QGIS
         except ImportError:
             raise QgsProcessingException(self.tr(
-                "Не найдены библиотеки GDAL для Python — без них DXF не прочитать"))
+                "Не найдены библиотеки GDAL для Python — без них DXF не прочитать. Обычно они входят в состав QGIS: переустановите QGIS"))
         gdal.UseExceptions()
 
         path = self.parameterAsFile(parameters, self.INPUT, context)
         if not path or not os.path.exists(path):
-            raise QgsProcessingException(self.tr("Файл чертежа не найден"))
+            raise QgsProcessingException(self.tr("Файл чертежа не найден — выберите существующий файл DXF"))
         self.check_kind(path)
 
         crs = self.parameterAsCrs(parameters, self.CRS, context)
@@ -387,7 +398,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
                                                split, keep_z, closed, feedback)
             self.check_coordinates(crs, extent, feedback)
             if not groups and not labels:
-                raise QgsProcessingException(self.tr("В чертеже нет объектов с геометрией"))
+                raise QgsProcessingException(self.tr("В чертеже нет объектов с геометрией — только служебные записи. Проверьте, что чертёж сохранён вместе с пространством модели"))
             written = self.write(gdal, ogr, osr, layer, out_path, crs, groups, labels, attrs,
                                  marks, label_mode, split, keep_z, closed, feedback)
             ds = None
@@ -407,15 +418,21 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
         kind = dxf_read.file_kind(path)
         if kind == "dwg":
             raise QgsProcessingException(self.tr(
-                "Это файл DWG, а не DXF. Модуль читает только DXF: откройте чертёж в "
-                "AutoCAD и сохраните как DXF («Сохранить как» → DXF). Встроенное в QGIS "
-                "окно «Проект → Импорт/Экспорт → Импорт слоёв из DWG/DXF» читает и DWG, "
-                "но без атрибутов блоков."))
+                "Это файл DWG, а не DXF — модуль читает только DXF. Три способа получить "
+                "из него DXF:\n"
+                "1. AutoCAD: «Сохранить как» → DXF. Ничего не теряется.\n"
+                "2. Бесплатная программа LibreDWG ({url}): поставить её и перевести чертёж "
+                "самому — командой «dwg2dxf -o чертёж.dxf чертёж.dwg», затем открыть "
+                "полученный DXF этим окном. Модуль её не вызывает, DWG 2004–2018 она "
+                "читает не полностью — сверьте число объектов.\n"
+                "3. Встроенное окно QGIS «Проект → Импорт/Экспорт → Импорт слоёв из "
+                "DWG/DXF» читает DWG само, но не делает из атрибутов блоков поля таблицы."
+            ).format(url=LIBREDWG_SITE))
         if kind == "dxf-binary":
             raise QgsProcessingException(self.tr(
                 "Это двоичный DXF, он не читается. Сохраните чертёж обычным (текстовым) DXF."))
         if kind != "dxf":
-            raise QgsProcessingException(self.tr("Файл не похож на DXF"))
+            raise QgsProcessingException(self.tr("Файл не похож на чертёж DXF. Нужен текстовый DXF; если это DWG, сохраните его в AutoCAD как DXF"))
 
     def encoding_for(self, path, choice, feedback):
         """Кодировка: выбранная или распознанная по содержимому файла."""
@@ -469,9 +486,9 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
         try:
             ds = gdal.OpenEx(path, gdal.OF_VECTOR)
         except Exception as e:
-            raise QgsProcessingException(self.tr("Чертёж не открылся: {}").format(e))
+            raise QgsProcessingException(self.tr("Чертёж не открылся: {}. Проверьте, что файл цел и открывается в AutoCAD").format(e))
         if ds is None or ds.GetLayerCount() == 0:
-            raise QgsProcessingException(self.tr("В чертеже нет данных"))
+            raise QgsProcessingException(self.tr("В чертеже нет данных — похоже, файл пуст или испорчен. Откройте его в AutoCAD и сохраните заново"))
         return ds
 
     # — первый проход —
@@ -593,7 +610,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
                 ["GEOMETRY_NAME=geom", "SPATIAL_INDEX=YES", "OVERWRITE=YES"])
             if group.layer is None:
                 raise QgsProcessingException(
-                    self.tr("Слой «{}» не создался в GeoPackage").format(group.name))
+                    self.tr("Слой «{}» не создался в GeoPackage — возможно, файл открыт в другой программе. Закройте его и повторите").format(group.name))
             for name in group.fields:
                 group.layer.CreateField(ogr.FieldDefn(name, ogr.OFTString))
             names.append(group.name)
@@ -659,7 +676,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
         """Создать GeoPackage или открыть существующий, не тронув чужие слои."""
         driver = ogr.GetDriverByName("GPKG")
         if driver is None:
-            raise QgsProcessingException(self.tr("В GDAL нет записи GeoPackage"))
+            raise QgsProcessingException(self.tr("В этой сборке GDAL нет записи GeoPackage — переустановите QGIS"))
         out_ds = None
         if os.path.exists(out_path):
             try:
@@ -682,13 +699,39 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             out_ds = driver.CreateDataSource(out_path)
         if out_ds is None:
             raise QgsProcessingException(
-                self.tr("Не удалось создать файл «{}»").format(out_path))
+                self.tr("Не удалось создать файл «{}». Проверьте, что папка существует и доступна для записи").format(out_path))
+        return out_ds, self.spatial_reference(osr, crs)
+
+    def spatial_reference(self, osr, crs):
+        """СК для GDAL: по коду справочника, иначе описанием.
+
+        По коду — потому что от описания из QGIS GDAL ругается на несовпадение с
+        официальным и заводит в GeoPackage свою запись СК. Но код пользовательской
+        СК («USER:100000», так выглядит МСК) GDAL не понимает: на 3.44 и 4 он
+        бросает «OGR Error: Corrupt data», и алгоритм обрывался трассировкой.
+        """
         srs = osr.SpatialReference()
-        # по коду, если он есть: описание из QGIS GDAL считает несовпадающим
-        # с официальным и заводит в GeoPackage свою запись СК
-        if not (crs.authid() and srs.SetFromUserInput(crs.authid()) == 0):
-            srs.ImportFromWkt(crs.toWkt())
-        return out_ds, srs
+        if crs.authid().upper().startswith(AUTHORITIES):
+            try:
+                if srs.SetFromUserInput(crs.authid()) == 0:
+                    return srs
+            except RuntimeError:
+                pass
+        srs = osr.SpatialReference()
+        try:
+            if srs.ImportFromWkt(crs.toWkt()) == 0:
+                # у СК из строки PROJ названия нет («unknown»), а имя МСК живёт
+                # только в реестре QGIS — переносим его в файл сами.
+                # SetProjCS, а не SetName: в привязках Python SetName нет.
+                if crs.description() and srs.GetName() in (None, "", "unknown"):
+                    srs.SetProjCS(crs.description())
+                return srs
+        except RuntimeError:
+            pass
+        raise QgsProcessingException(self.tr(
+            "Не удалось записать систему координат «{}» в GeoPackage. Выберите другую "
+            "систему координат в поле «Система координат чертежа»."
+        ).format(crs.description() or crs.authid() or "без названия"))
 
     def one_geometry(self, ogr, parts, group, types):
         """Фигуры одного вида → одна геометрия типа слоя."""
@@ -744,7 +787,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
                                    ["GEOMETRY_NAME=geom", "SPATIAL_INDEX=YES", "OVERWRITE=YES"])
         if layer is None:
             raise QgsProcessingException(
-                self.tr("Слой «{}» не создался в GeoPackage").format(name))
+                self.tr("Слой «{}» не создался в GeoPackage — возможно, файл открыт в другой программе. Закройте его и повторите").format(name))
         for field in ("dxf_layer", "handle", "text"):
             layer.CreateField(ogr.FieldDefn(field, ogr.OFTString))
         out_ds.StartTransaction()

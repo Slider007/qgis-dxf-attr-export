@@ -371,7 +371,7 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
         """Копии слоёв готовятся в основном потоке: слои проекта читаются здесь."""
         dxf_layers = QgsProcessingParameterDxfLayers.parameterAsLayers(parameters[self.LAYERS], context)
         if not dxf_layers:
-            raise QgsProcessingException(self.tr("Не выбран ни один слой"))
+            raise QgsProcessingException(self.tr("Выберите хотя бы один слой в списке «Слои»"))
         selected_only = self.parameterAsBoolean(parameters, self.SELECTED_FEATURES_ONLY, context)
         use_title = self.parameterAsBoolean(parameters, self.USE_LAYER_TITLE, context)
         self._jobs = []
@@ -379,7 +379,7 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
         for dl in dxf_layers:
             layer = dl.layer()
             if layer is None or not layer.isValid():
-                raise QgsProcessingException(self.tr("Слой недоступен"))
+                raise QgsProcessingException(self.tr("Один из выбранных слоёв не открывается. Проверьте, что файл на месте и не занят другой программой, затем выберите слои заново"))
             request = QgsFeatureRequest()
             if selected_only:
                 request.setFilterFids(layer.selectedFeatureIds())
@@ -392,7 +392,7 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
             fields = layer.fields()
             if fields.lookupField(KEY_FIELD) >= 0:
                 raise QgsProcessingException(
-                    self.tr("В слое «{}» уже есть поле {}").format(layer.name(), KEY_FIELD))
+                    self.tr("В слое «{}» уже есть поле {} — модуль занимает его под служебное. Переименуйте поле в слое и повторите").format(layer.name(), KEY_FIELD))
             copy.dataProvider().addAttributes([QgsField(KEY_FIELD, QMetaType.Type.QString)])
             copy.updateFields()
             key_idx = copy.fields().lookupField(KEY_FIELD)
@@ -430,7 +430,7 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
     def processAlgorithm(self, parameters, context, feedback):
         crs = self.parameterAsCrs(parameters, self.CRS, context)
         if not crs.isValid():
-            raise QgsProcessingException(self.tr("Не задана система координат"))
+            raise QgsProcessingException(self.tr("Выберите систему координат: в ней будут записаны координаты чертежа"))
         mode = SYMBOLOGY_MODES[self.parameterAsEnum(parameters, self.SYMBOLOGY_MODE, context)]
         scale = self.parameterAsDouble(parameters, self.SYMBOLOGY_SCALE, context) or 1000.0
         encoding = QgsDxfExport.encodings()[self.parameterAsEnum(parameters, self.ENCODING, context)]
@@ -445,7 +445,7 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
         write_prj = self.parameterAsBoolean(parameters, self.WRITE_PRJ, context)
         path = self.parameterAsFileOutput(parameters, self.OUTPUT, context)
         if not path:
-            raise QgsProcessingException(self.tr("Не задан файл DXF"))
+            raise QgsProcessingException(self.tr("Укажите, куда сохранить файл DXF"))
 
         # Точки вставки блоков и общий охват — в выбранной СК
         total = sum(len(job[4]) for job in self._jobs) or 1
@@ -473,7 +473,7 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
                         geom.transform(transform)
                     except Exception as e:  # точка вне области действия СК
                         raise QgsProcessingException(
-                            self.tr("Не удалось пересчитать объект слоя «{}» в {}: {}").format(
+                            self.tr("Объект слоя «{}» не пересчитывается в {} — возможно, он лежит вне области действия этой системы координат. Выберите подходящую СК. Подробности: {}").format(
                                 copy.name(), crs.authid(), e))
                     fb.anchor = anchor_point(geom)
                     extent.combineExtentWith(geom.boundingBox())
@@ -514,7 +514,7 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
                 dl.dataDefinedBlocksMaximumNumberOfClasses(), dl.overriddenName()))
             blocks_layers.append(dxf_blocks.ExportLayer(prompts, [fb for _, fb in features]))
         if extent.isNull():
-            raise QgsProcessingException(self.tr("В выбранных слоях нет объектов с геометрией"))
+            raise QgsProcessingException(self.tr("В выбранных слоях нет объектов с геометрией — выгружать нечего. Проверьте, что в слоях есть объекты и что они не скрыты стилем"))
         pad = max(extent.width(), extent.height(), 1.0) * 0.01
         extent.grow(pad)
 
@@ -536,11 +536,11 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
             export.setFlags(QgsDxfExport.Flag.FlagNoMText)
         out = QFile(path)
         if not out.open(QIODevice.OpenModeFlag.WriteOnly | QIODevice.OpenModeFlag.Truncate):
-            raise QgsProcessingException(self.tr("Не удалось открыть файл для записи: {}").format(path))
+            raise QgsProcessingException(self.tr("Не удалось сохранить «{}». Возможно, файл открыт в другой программе — закройте её и повторите").format(path))
         status = export.writeToFile(out, encoding)
         out.close()
         if status != QgsDxfExport.ExportResult.Success:
-            raise QgsProcessingException(self.tr("QGIS не смог записать DXF: {} {}").format(
+            raise QgsProcessingException(self.tr("QGIS не смог записать DXF: {} {}. Попробуйте другую папку или уберите из выгрузки слой, на котором всё остановилось").format(
                 status, export.feedbackMessage()))
         feedback.setProgress(60)
         if feedback.isCanceled():
@@ -549,9 +549,16 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr("Запись атрибутов в блоки…"))
         factor = QgsUnitTypes.fromUnitToUnitFactor(Qgis.DistanceUnit.Meters, crs.mapUnits())
         text_height = 0.0025 * scale * factor
-        result = dxf_blocks.add_attribute_blocks(
-            path, encoding, blocks_layers, text_height=text_height, visible=visible,
-            insunits=INSUNITS.get(crs.mapUnits()))
+        try:
+            result = dxf_blocks.add_attribute_blocks(
+                path, encoding, blocks_layers, text_height=text_height, visible=visible,
+                insunits=INSUNITS.get(crs.mapUnits()))
+        except ValueError as e:
+            # разбор DXF, записанного QGIS: до человека это должно дойти словами,
+            # а не трассировкой
+            raise QgsProcessingException(self.tr(
+                "Не удалось записать атрибуты в блоки: {}. Файл DXF остался без атрибутов — "
+                "попробуйте выгрузить меньше слоёв или выберите другую кодировку.").format(e))
         feedback.setProgress(95)
 
         if write_prj:

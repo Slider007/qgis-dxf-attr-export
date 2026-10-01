@@ -30,6 +30,8 @@ from osgeo import ogr  # noqa: E402
 from qgis.core import (  # noqa: E402
     Qgis,
     QgsApplication,
+    QgsCoordinateReferenceSystem,
+    QgsRectangle,
     QgsCategorizedSymbolRenderer,
     QgsDxfExport,
     QgsFeature,
@@ -755,6 +757,8 @@ def read_gpkg(path):
             "type": ogr.GeometryTypeToName(layer.GetGeomType()),
             "crs": (layer.GetSpatialRef().GetAuthorityCode(None)
                     if layer.GetSpatialRef() else None),
+            "crs_name": (layer.GetSpatialRef().GetName()
+                         if layer.GetSpatialRef() else None),
             "fields": [layer.GetLayerDefn().GetFieldDefn(n).GetName()
                        for n in range(layer.GetLayerDefn().GetFieldCount())],
         }
@@ -878,8 +882,10 @@ class ImportTest(unittest.TestCase):
             f.write(b"AC1032\x00\x00" + b"\x00" * 200)
         with self.assertRaises(QgsProcessingException) as caught:
             self.run_import("imp_dwg.gpkg", path=path)
-        self.assertIn("DWG", str(caught.exception))
-        self.assertIn("DXF", str(caught.exception))
+        message = str(caught.exception)
+        for part in ("DWG", "DXF", "AutoCAD", "LibreDWG", "dwg2dxf",
+                     "https://www.gnu.org/software/libredwg/"):
+            self.assertIn(part, message, part)
 
     def test_round_trip_keeps_attributes(self):
         """Выгрузка и чтение обратно: значения полей возвращаются полями."""
@@ -900,6 +906,22 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(rows[0]["name"], "Опора №1")
         self.assertEqual(rows[0]["kind"], "анкерная")
         self.assertEqual(rows[0]["block"], "Опоры_1")
+
+    def test_import_into_user_crs(self):
+        """Чтение в МСК: она зарегистрирована как пользовательская СК (USER:n).
+
+        GDAL такой код не понимает — на QGIS 3.44 и 4 импорт обрывался
+        «OGR Error: Corrupt data».
+        """
+        from dxf_attr_export import msk
+        zone = msk.zones_for(50, 38.3)[0]
+        crs = msk.crs_for(zone)
+        self.assertTrue(crs.isValid(), "МСК не собралась")
+        self.assertTrue(crs.authid().startswith("USER:"), crs.authid())
+        got = self.run_import("imp_msk.gpkg", CRS=crs)
+        layer = got["Границы (полигоны)"]
+        self.assertEqual(len(layer["rows"]), 1)
+        self.assertIn("МСК-50 зона 2", layer["crs_name"] or "")
 
     def test_existing_geopackage_is_not_destroyed(self):
         """Чужие слои в указанном GeoPackage должны уцелеть."""
@@ -1053,6 +1075,168 @@ class AlgorithmApiTest(unittest.TestCase):
                             if p.default is p.empty and p.kind is p.POSITIONAL_OR_KEYWORD]
                 self.assertEqual(required, [], "{}.{} подменяет метод Processing".format(
                     type(alg).__name__, name))
+
+
+def reverse_answer(iso, state):
+    """Ответ сервиса адресов OpenStreetMap в том виде, в каком его разбирает msk."""
+    return {"address": {"state": state, "ISO3166-2-lvl4": iso, "country": "Россия",
+                        "country_code": "ru"}}
+
+
+class MskPrefillTest(unittest.TestCase):
+    """СК чертежа подставляется по центру карты: чертежи AutoCAD обычно в МСК."""
+
+    def canvas(self, extent=None, crs="EPSG:4326"):
+        canvas = QgsMapCanvas()
+        canvas.setDestinationCrs(QgsCoordinateReferenceSystem(crs))
+        canvas.setExtent(extent if extent is not None else QgsRectangle(38.2, 55.6, 38.4, 55.8))
+        return canvas
+
+    def setUp(self):
+        from dxf_attr_export import msk
+        self.msk = msk
+        self.original = msk.reverse_geocode
+        self.project_crs = QgsProject.instance().crs()
+        # у проекта градусы — как при работе с подложкой
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem("EPSG:4326"))
+        # в проекте есть слой: по пустому проекту место не определяется
+        self.layer = make_layer("Point", "Карта", "field=a:string",
+                                [("POINT(38.3 55.7)", ["точка"])])
+        QgsProject.instance().addMapLayer(self.layer)
+
+    def tearDown(self):
+        self.msk.reverse_geocode = self.original
+        QgsProject.instance().setCrs(self.project_crs)
+        if self.layer.id() in QgsProject.instance().mapLayers():
+            QgsProject.instance().removeMapLayer(self.layer.id())
+
+    def answer_moscow(self):
+        self.msk.reverse_geocode = lambda lon, lat: (
+            reverse_answer("RU-MOS", "Московская область"), None)
+
+    def test_msk_by_map_center(self):
+        from dxf_attr_export.plugin import drawing_crs
+        self.answer_moscow()
+        crs, name, problem = drawing_crs(self.canvas(), QgsProject.instance())
+        self.assertIsNone(problem)
+        self.assertIn("МСК-50 зона 2", name)
+        # в поле окна человек должен увидеть название, а не строку PROJ
+        self.assertIn("МСК-50 зона 2", crs.description())
+        self.assertFalse(crs.isGeographic())
+
+    def test_zone_by_longitude(self):
+        """Зона выбирается по близости осевого меридиана."""
+        from dxf_attr_export.plugin import drawing_crs
+        self.answer_moscow()
+        _, east, _ = drawing_crs(self.canvas(QgsRectangle(38.2, 55.6, 38.4, 55.8)),
+                                 QgsProject.instance())
+        _, west, _ = drawing_crs(self.canvas(QgsRectangle(35.7, 55.6, 35.9, 55.8)),
+                                 QgsProject.instance())
+        self.assertIn("зона 2", east)
+        self.assertIn("зона 1", west)
+
+    def test_project_crs_kept_when_metric(self):
+        """У проекта уже метровая СК — это осознанный выбор, не подменяем."""
+        from dxf_attr_export.plugin import drawing_crs
+        self.answer_moscow()
+        chosen = QgsCoordinateReferenceSystem(CRS)
+        QgsProject.instance().setCrs(chosen)
+        crs, name, problem = drawing_crs(self.canvas(), QgsProject.instance())
+        self.assertEqual(crs, chosen)
+        self.assertIsNone(name)
+        self.assertIsNone(problem)
+
+    def test_web_mercator_is_replaced(self):
+        """Веб-Меркатор (подложка) чертежу не годится — подставляем МСК."""
+        from dxf_attr_export.plugin import drawing_crs
+        self.answer_moscow()
+        QgsProject.instance().setCrs(QgsCoordinateReferenceSystem("EPSG:3857"))
+        canvas = self.canvas(QgsRectangle(4250000, 7480000, 4280000, 7500000), "EPSG:3857")
+        crs, name, _ = drawing_crs(canvas, QgsProject.instance())
+        self.assertIn("МСК-50", name)
+        self.assertNotEqual(crs.authid(), "EPSG:3857")
+
+    def test_project_crs_when_service_silent(self):
+        """Нет сети — берём СК проекта и говорим об этом, а не падаем."""
+        from dxf_attr_export.plugin import drawing_crs
+        self.msk.reverse_geocode = lambda lon, lat: (None, "Нет ответа от сервиса адресов.")
+        crs, name, problem = drawing_crs(self.canvas(), QgsProject.instance())
+        self.assertEqual(crs, QgsProject.instance().crs())
+        self.assertIsNone(name)
+        self.assertIn("Нет ответа", problem)
+
+    def test_project_crs_outside_russia(self):
+        from dxf_attr_export.plugin import drawing_crs
+        self.msk.reverse_geocode = lambda lon, lat: (
+            {"address": {"country": "Казахстан", "country_code": "kz"}}, None)
+        crs, name, problem = drawing_crs(self.canvas(QgsRectangle(71.0, 51.0, 71.2, 51.2)),
+                                         QgsProject.instance())
+        self.assertEqual(crs, QgsProject.instance().crs())
+        self.assertIsNone(name)
+        self.assertIsNone(problem)
+
+    def test_waiting_for_service_is_limited(self):
+        """Окно не должно висеть минуту: ожидание ограничено и потом возвращается."""
+        from qgis.core import QgsNetworkAccessManager
+        from dxf_attr_export.plugin import drawing_crs, LOOKUP_TIMEOUT
+        seen = []
+
+        def spy(lon, lat):
+            seen.append(QgsNetworkAccessManager.timeout())
+            return None, "Нет ответа от сервиса адресов."
+
+        self.msk.reverse_geocode = spy
+        before = QgsNetworkAccessManager.timeout()
+        drawing_crs(self.canvas(), QgsProject.instance())
+        self.assertEqual(seen, [LOOKUP_TIMEOUT])
+        self.assertEqual(QgsNetworkAccessManager.timeout(), before)
+
+    def test_both_windows_open_with_msk(self):
+        """И выгрузка, и чтение открываются с подставленной МСК."""
+        import processing as processing_module
+        from dxf_attr_export.plugin import ALGORITHM_ID, IMPORT_ALGORITHM_ID
+        self.answer_moscow()
+        iface = Iface()
+        iface.canvas.setDestinationCrs(QgsCoordinateReferenceSystem("EPSG:4326"))
+        iface.canvas.setExtent(QgsRectangle(38.2, 55.6, 38.4, 55.8))
+        plugin = dxf_attr_export.classFactory(iface)
+        plugin.initGui()
+        opened = []
+        original = processing_module.execAlgorithmDialog
+        processing_module.execAlgorithmDialog = lambda alg, params: opened.append((alg, params))
+        try:
+            plugin.run()
+            plugin.run_import()
+        finally:
+            processing_module.execAlgorithmDialog = original
+            plugin.unload()
+            app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.assertEqual([alg for alg, _ in opened], [ALGORITHM_ID, IMPORT_ALGORITHM_ID])
+        for alg, params in opened:
+            self.assertIn("МСК-50 зона 2", params["CRS"].description(), alg)
+
+    def test_empty_project_does_not_ask_network(self):
+        """По пустому проекту место не определить — в сеть не ходим."""
+        from dxf_attr_export.plugin import drawing_crs
+        asked = []
+        self.msk.reverse_geocode = lambda lon, lat: asked.append(1) or (None, "не спрашивали")
+        # takeMapLayer, а не removeMapLayer: тот удаляет объект слоя
+        taken = QgsProject.instance().takeMapLayer(self.layer)
+        try:
+            crs, name, problem = drawing_crs(self.canvas(), QgsProject.instance())
+        finally:
+            QgsProject.instance().addMapLayer(taken)
+        self.assertEqual(asked, [], "лишний запрос в сеть")
+        self.assertEqual(crs, QgsProject.instance().crs())
+        self.assertIsNone(name)
+        self.assertIsNone(problem)
+
+    def test_no_canvas(self):
+        from dxf_attr_export.plugin import drawing_crs
+        crs, name, problem = drawing_crs(None, QgsProject.instance())
+        self.assertEqual(crs, QgsProject.instance().crs())
+        self.assertIsNone(name)
+        self.assertIsNone(problem)
 
 
 class PluginTest(unittest.TestCase):
