@@ -1176,20 +1176,21 @@ class MskPrefillTest(unittest.TestCase):
         self.assertIsNone(problem)
 
     def test_waiting_for_service_is_limited(self):
-        """Окно не должно висеть минуту: ожидание ограничено и потом возвращается."""
+        """Окно не должно висеть: срок стоит у самого запроса, а не у всей сети QGIS.
+
+        Общий таймаут QGIS — 60 секунд; укорачивать его на время нашего запроса
+        нельзя, заодно укоротятся чужие.
+        """
         from qgis.core import QgsNetworkAccessManager
-        from dxf_attr_export.plugin import drawing_crs, LOOKUP_TIMEOUT
-        seen = []
-
-        def spy(lon, lat):
-            seen.append(QgsNetworkAccessManager.timeout())
-            return None, "Нет ответа от сервиса адресов."
-
-        self.msk.reverse_geocode = spy
-        before = QgsNetworkAccessManager.timeout()
-        drawing_crs(self.canvas(), QgsProject.instance())
-        self.assertEqual(seen, [LOOKUP_TIMEOUT])
-        self.assertEqual(QgsNetworkAccessManager.timeout(), before)
+        from dxf_attr_export import msk
+        from dxf_attr_export.plugin import LOOKUP_TIMEOUT
+        self.assertLessEqual(LOOKUP_TIMEOUT, 10000)
+        self.assertEqual(msk.TIMEOUT_MS, LOOKUP_TIMEOUT, "наш срок не подставился")
+        # и он действительно доезжает до запроса (если msk переименуют — упадёт)
+        request = msk._request(38.3, 55.7)
+        self.assertEqual(request.transferTimeout(), LOOKUP_TIMEOUT)
+        self.assertNotEqual(QgsNetworkAccessManager.timeout(), LOOKUP_TIMEOUT,
+                            "общий таймаут сети трогать не нужно")
 
     def test_both_windows_open_with_msk(self):
         """И выгрузка, и чтение открываются с подставленной МСК."""
@@ -1230,6 +1231,26 @@ class MskPrefillTest(unittest.TestCase):
         self.assertEqual(crs, QgsProject.instance().crs())
         self.assertIsNone(name)
         self.assertIsNone(problem)
+
+    def test_message_adds_what_to_do(self):
+        """Общий msk.py даёт нейтральный текст — окно дописывает, что делать."""
+        from dxf_attr_export import msk
+        iface = Iface()
+        said = []
+        iface.bar_messages = said
+        plugin = dxf_attr_export.classFactory(iface)
+        plugin.message = lambda text, level=None, seconds=10: said.append(text)
+        plugin.say(None, msk.NO_ANSWER)
+        self.assertEqual(len(said), 1)
+        # «нет связи» утверждать нельзя: сервис мог просто не успеть ответить
+        self.assertNotIn("Нет связи", said[0])
+        self.assertIn("не ответил", said[0])
+        self.assertIn("выберите её в окне", said[0], "не сказано, что делать")
+
+        said.clear()
+        plugin.say(None, "Сервис адресов OpenStreetMap ответил непонятно.")
+        self.assertIn("ответил непонятно", said[0], "чужой текст должен доходить как есть")
+        self.assertIn("выберите её в окне", said[0])
 
     def test_no_canvas(self):
         from dxf_attr_export.plugin import drawing_crs

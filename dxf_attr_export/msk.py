@@ -10,11 +10,15 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
 )
 from qgis.PyQt.QtCore import QUrl, QUrlQuery
-from qgis.PyQt.QtNetwork import QNetworkRequest
+from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 
 DATA = os.path.join(os.path.dirname(__file__), "msk.json")
 NOMINATIM = "https://nominatim.openstreetmap.org/reverse"
 USER_AGENT = "QGIS plugin project_utm_crs (https://github.com/Slider007/qgis-project-utm-crs)"
+TIMEOUT_MS = 10000
+# Файл копируется в другие модули, поэтому текст без действий: кнопки у них свои,
+# что делать дальше — дописывает окно модуля.
+NO_ANSWER = "Нет связи с сервисом адресов OpenStreetMap."
 
 # Код субъекта по ISO 3166-2:RU (так его отдаёт Nominatim в ISO3166-2-lvl4)
 ISO_TO_CODE = {
@@ -84,8 +88,8 @@ def _norm(text):
     return re.sub(r"[^а-яёa-z0-9]", "", text.lower().replace("ё", "е"))
 
 
-def reverse_geocode(lon, lat):
-    """Запрос к Nominatim. Возвращает (ответ, None) или (None, текст ошибки)."""
+def _request(lon, lat):
+    """Запрос к Nominatim с собственным сроком ожидания."""
     url = QUrl(NOMINATIM)
     query = QUrlQuery()
     for key, value in (("lat", "%.6f" % lat), ("lon", "%.6f" % lon), ("format", "jsonv2"),
@@ -94,13 +98,35 @@ def reverse_geocode(lon, lat):
     url.setQuery(query)
     request = QNetworkRequest(url)
     request.setRawHeader(b"User-Agent", USER_AGENT.encode())
-    blocking = QgsBlockingNetworkRequest()
-    if blocking.get(request) != QgsBlockingNetworkRequest.ErrorCode.NoError:
-        return None, "Нет ответа от сервиса адресов OpenStreetMap: " + blocking.errorMessage()
+    # свой срок: общий таймаут сети QGIS — 60 с, столько ждать ответа о субъекте незачем
+    request.setTransferTimeout(TIMEOUT_MS)
+    return request
+
+
+def _answer_from_reply(reply):
+    """(ответ, ошибка) из ответа сети.
+
+    При истёкшем сроке QgsBlockingNetworkRequest возвращает NoError, а в самом ответе
+    стоит ошибка и пустое тело: без этой проверки человек читал «непонятный ответ»
+    вместо «нет связи».
+    """
+    if reply.error() != QNetworkReply.NetworkError.NoError:
+        return None, NO_ANSWER
+    body = bytes(reply.content()).strip()
+    if not body:
+        return None, NO_ANSWER
     try:
-        return json.loads(bytes(blocking.reply().content()).decode("utf-8")), None
+        return json.loads(body.decode("utf-8")), None
     except ValueError:
-        return None, "Сервис адресов OpenStreetMap вернул непонятный ответ."
+        return None, "Сервис адресов OpenStreetMap ответил непонятно."
+
+
+def reverse_geocode(lon, lat):
+    """Запрос к Nominatim. Возвращает (ответ, None) или (None, текст ошибки)."""
+    blocking = QgsBlockingNetworkRequest()
+    if blocking.get(_request(lon, lat)) != QgsBlockingNetworkRequest.ErrorCode.NoError:
+        return None, NO_ANSWER
+    return _answer_from_reply(blocking.reply())
 
 
 def zones_for(code, lon):

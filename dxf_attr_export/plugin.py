@@ -7,7 +7,6 @@ from qgis.core import (
     QgsCoordinateTransform,
     QgsCsException,
     QgsDxfExport,
-    QgsNetworkAccessManager,
     QgsProcessingParameterDxfLayers,
     QgsProject,
     QgsVectorLayer,
@@ -28,9 +27,11 @@ PLUGIN_DIR = os.path.dirname(__file__)
 # msk.py и msk.json — копии из модуля project_utm_crs, правятся там.
 # Представляемся сервису адресов своим именем, файл при этом не меняем.
 msk.USER_AGENT = "QGIS plugin dxf_attr_export (https://github.com/Slider007/qgis-dxf-attr-export)"
-# Сколько ждём сервис адресов: QGIS по умолчанию ждёт минуту, а окно за это
-# время не должно висеть. Не ответил — откроемся с СК проекта.
+# Сколько ждём сервис адресов: окно открывается по нажатию кнопки, и висеть ему
+# нельзя. Не ответил — откроемся с СК проекта. Срок ставится самому запросу
+# (msk.TIMEOUT_MS), а не всей сети QGIS: иначе заодно укорачивались бы чужие запросы.
 LOOKUP_TIMEOUT = 5000
+msk.TIMEOUT_MS = LOOKUP_TIMEOUT
 ALGORITHM_ID = "dxfattrexport:exportdxf"
 IMPORT_ALGORITHM_ID = "dxfattrexport:importdxf"
 
@@ -75,12 +76,7 @@ def drawing_crs(canvas, project):
     if place is None:
         return current, None, None
     lon, lat = place
-    was = QgsNetworkAccessManager.timeout()
-    QgsNetworkAccessManager.setTimeout(LOOKUP_TIMEOUT)
-    try:
-        answer, error = msk.reverse_geocode(lon, lat)
-    finally:
-        QgsNetworkAccessManager.setTimeout(was)
+    answer, error = msk.reverse_geocode(lon, lat)
     if error:
         return current, None, error
     code, name = msk.region_from_reverse(answer)
@@ -191,10 +187,20 @@ class DxfAttrExportPlugin:
             bar.pushMessage("DXF", text, level, seconds)
 
     def say(self, note, problem):
-        """Сказать, какая СК подставлена или почему не вышло."""
+        """Сказать, какая СК подставлена или почему не вышло.
+
+        Тексты из общего `msk.py` нейтральные («Нет связи с сервисом адресов
+        OpenStreetMap.»); что делать дальше, дописывает тот модуль, который
+        показывает сообщение, — это наше дело.
+        """
+        if problem == msk.NO_ANSWER:
+            # «нет связи» — не всегда правда: сервис бесплатный и временами отвечает
+            # 3–6 секунд, а ждать дольше окну нельзя. Говорим то, что знаем точно.
+            problem = ("Не удалось определить МСК: сервис адресов OpenStreetMap не ответил "
+                       "за {} с.".format(LOOKUP_TIMEOUT // 1000))
         if problem:
-            self.message(problem + " Система координат — как у проекта.",
-                         Qgis.MessageLevel.Warning)
+            self.message(problem + " Система координат взята из проекта: если чертёж "
+                                   "в МСК, выберите её в окне.", Qgis.MessageLevel.Warning)
         elif note:
             self.message(note)
 
