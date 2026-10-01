@@ -711,6 +711,32 @@ def tag_block(name, handle, shapes):
 SQUARE = [(0, 0), (100, 0), (100, 100), (0, 100)]
 
 
+def tag_line(handle, layer, start, end, z=None):
+    """Отрезок; с z — объёмный."""
+    tags = ["0", "LINE", "5", handle, "8", layer,
+            "10", repr(float(start[0])), "20", repr(float(start[1]))]
+    if z is not None:
+        tags += ["30", repr(float(z))]
+    tags += ["11", repr(float(end[0])), "21", repr(float(end[1]))]
+    if z is not None:
+        tags += ["31", repr(float(z))]
+    return tags
+
+
+class Collector(QgsProcessingFeedback):
+    """Собирает предупреждения алгоритма."""
+
+    def __init__(self):
+        super().__init__()
+        self.warnings = []
+
+    def pushWarning(self, text):
+        self.warnings.append(text)
+
+    def reportError(self, text, fatalError=False):
+        self.warnings.append(text)
+
+
 def read_gpkg(path):
     """GeoPackage → {имя слоя: [{поле: значение, "wkt": …, "type": …}]}."""
     ds = ogr.Open(path)
@@ -875,6 +901,74 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "анкерная")
         self.assertEqual(rows[0]["block"], "Опоры_1")
 
+    def test_existing_geopackage_is_not_destroyed(self):
+        """Чужие слои в указанном GeoPackage должны уцелеть."""
+        out = os.path.join(OUT, "imp_existing.gpkg")
+        layer = QgsVectorLayer("Point?crs={}&field=a:string".format(CRS), "Чужой слой", "memory")
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry.fromWkt("POINT(1 2)"))
+        feature.setAttributes(["беречь"])
+        layer.dataProvider().addFeatures([feature])
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = "GPKG"
+        options.layerName = "Чужой слой"
+        QgsVectorFileWriter.writeAsVectorFormatV3(
+            layer, out, QgsCoordinateTransformContext(), options)
+
+        collector = Collector()
+        processing.run(IMPORT_ALG, {"INPUT": self.path, "CRS": CRS, "OUTPUT": out},
+                       feedback=collector)
+        got = read_gpkg(out)
+        self.assertIn("Чужой слой", got, "чужой слой удалён")
+        self.assertEqual(got["Чужой слой"]["rows"][0]["a"], "беречь")
+        self.assertIn("Границы (полигоны)", got)
+        self.assertTrue(any("уже существует" in w for w in collector.warnings),
+                        collector.warnings)
+
+    def test_warning_when_crs_is_degrees(self):
+        """Метровый чертёж с градусной СК — предупреждение, а не молчание."""
+        collector = Collector()
+        processing.run(IMPORT_ALG, {"INPUT": self.path, "CRS": "EPSG:4326",
+                                    "OUTPUT": os.path.join(OUT, "imp_wgs.gpkg")},
+                       feedback=collector)
+        self.assertTrue(any("это метры" in w for w in collector.warnings), collector.warnings)
+
+    def test_warning_when_output_is_temporary(self):
+        """Временный файл пропадёт — об этом надо сказать."""
+        from qgis.core import QgsProcessingUtils
+        out = os.path.join(QgsProcessingUtils.tempFolder(), "imp_temp.gpkg")
+        collector = Collector()
+        processing.run(IMPORT_ALG, {"INPUT": self.path, "CRS": CRS, "OUTPUT": out},
+                       feedback=collector)
+        self.assertTrue(any("временную папку" in w for w in collector.warnings),
+                        collector.warnings)
+
+    def test_export_warns_about_temporary_file(self):
+        """Временный DXF отдавать в работу нельзя — об этом надо сказать."""
+        from qgis.core import QgsProcessingUtils
+        layer = make_layer("Point", "Опоры", "field=name:string",
+                           [("POINT(400000 6000000)", ["Опора №1"])])
+        QgsProject.instance().addMapLayer(layer)
+        collector = Collector()
+        try:
+            processing.run(ALG, {"LAYERS": layers_param((layer, -1)), "CRS": CRS,
+                                 "OUTPUT": os.path.join(QgsProcessingUtils.tempFolder(),
+                                                        "export_temp.dxf")},
+                           feedback=collector)
+        finally:
+            QgsProject.instance().removeMapLayer(layer.id())
+        self.assertTrue(any("временную папку" in w for w in collector.warnings),
+                        collector.warnings)
+
+    def test_heights_do_not_split_layer(self):
+        """Слой чертежа с плоскими и объёмными объектами остаётся одним слоем."""
+        path = write_dxf("imp_z.dxf",
+                         tag_line("100", "Дороги", (0, 0), (10, 10))
+                         + tag_line("101", "Дороги", (20, 20), (30, 30), z=5))
+        got = self.run_import("imp_z.gpkg", path=path, KEEP_Z=True)
+        self.assertEqual(sorted(got), ["Дороги (линии)"], "слой разъехался надвое")
+        self.assertEqual(len(got["Дороги (линии)"]["rows"]), 2)
+
     def test_attribute_value_in_chunks(self):
         """Длинное значение атрибута пишется кусками (код 3) — склеивается обратно."""
         from dxf_attr_export import dxf_read
@@ -930,6 +1024,20 @@ class AlgorithmApiTest(unittest.TestCase):
             self.assertTrue(alg.group(), alg.name())
             self.assertTrue(alg.displayName(), alg.name())
 
+    def test_main_parameters_fit_without_scrolling(self):
+        """Главных полей немного, остальное — под «Дополнительно», и у каждого поля подсказка."""
+        from qgis.core import QgsProcessingParameterDefinition
+        advanced = QgsProcessingParameterDefinition.Flag.FlagAdvanced
+        expected = {"importdxf": ["INPUT", "CRS", "LABELS", "SPLIT_BY_LAYER", "OUTPUT"],
+                    "exportdxf": ["LAYERS", "BLOCK_CONTENT", "PATTERN_FILLS", "CRS",
+                                  "SELECTED_FEATURES_ONLY", "OUTPUT"]}
+        for alg in self.plugin.provider.algorithms():
+            main = [p.name() for p in alg.parameterDefinitions() if not (p.flags() & advanced)]
+            self.assertEqual(main, expected[alg.name()])
+            without_help = [p.name() for p in alg.parameterDefinitions()
+                            if not p.help() and p.name() not in ("FORCE_2D", "WRITE_PRJ")]
+            self.assertEqual(without_help, [], "поля без подсказки")
+
     def test_no_processing_method_shadowed(self):
         """Свой метод не должен подменять метод Processing."""
         import inspect
@@ -957,7 +1065,11 @@ class PluginTest(unittest.TestCase):
         bars = [b for b in iface.window.findChildren(QToolBar) if b.objectName() == "AltanEcoToolbar"]
         self.assertEqual(len(bars), 1)
         self.assertIsNotNone(registry.algorithmById(IMPORT_ALG))
-        self.assertEqual([a.text() for a in bars[0].actions()],
+        # на панели одна кнопка, оба действия — в её списке
+        self.assertEqual([a.text() for a in bars[0].actions()], ["DXF с атрибутами"])
+        button = bars[0].actions()[0]
+        self.assertIsNotNone(button.menu(), "у кнопки должен быть список действий")
+        self.assertEqual([a.text() for a in button.menu().actions()],
                          ["Экспорт в DXF с атрибутами…", "Импорт DXF в ГИС-формат…"])
         self.assertEqual(iface.menu, [("&Альтан-Эко", "Экспорт в DXF с атрибутами…"),
                                       ("&Альтан-Эко", "Импорт DXF в ГИС-формат…")])

@@ -30,6 +30,7 @@ from qgis.PyQt.QtCore import QCoreApplication, QDate, QDateTime, QFile, QIODevic
 from qgis.PyQt.QtXml import QDomDocument
 
 from .. import dxf_blocks
+from .params import add, is_temporary
 
 KEY_FIELD = "__dxf_attr_key"
 KEY_PREFIX = "QFX_"
@@ -295,46 +296,76 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
             "предупреждение.")
 
     def initAlgorithm(self, config=None):
-        self.addParameter(QgsProcessingParameterDxfLayers(self.LAYERS, self.tr("Слои")))
-        self.addParameter(QgsProcessingParameterEnum(
+        add(self, QgsProcessingParameterDxfLayers(self.LAYERS, self.tr("Слои")),
+            self.tr("В столбце «Output layer attribute» можно выбрать поле, значение "
+                    "которого станет именем слоя AutoCAD, — например тип опоры."))
+        add(self, QgsProcessingParameterEnum(
             self.BLOCK_CONTENT, self.tr("Оформление в блоках"),
-            [self.tr("Полное оформление QGIS (заливки, значки, толщины)"),
-             self.tr("Только границы объектов (полилинии и точки)")],
-            defaultValue=0))
-        self.addParameter(QgsProcessingParameterEnum(
-            self.PATTERN_FILLS, self.tr("Штриховка линиями (QGIS её не переносит)"),
-            [self.tr("Линиями — надёжно, файл крупнее"),
-             self.tr("Штриховкой AutoCAD — компактно"),
+            [self.tr("Полное оформление QGIS"),
+             self.tr("Только границы объектов")],
+            defaultValue=0),
+            self.tr("«Полное оформление» — цвета, толщины, заливки и значки, как на карте. "
+                    "«Только границы» — полигоны замкнутыми полилиниями (с дырками), линии "
+                    "полилиниями, точки точками AutoCAD."))
+        add(self, QgsProcessingParameterEnum(
+            self.PATTERN_FILLS, self.tr("Штриховка линиями"),
+            [self.tr("Линиями — файл крупнее"),
+             self.tr("Штриховкой AutoCAD — компактнее"),
              self.tr("Не переносить")],
-            defaultValue=0))
-        self.addParameter(QgsProcessingParameterEnum(
+            defaultValue=0),
+            self.tr("Штриховку линиями встроенный экспорт QGIS не переносит вовсе, модуль "
+                    "рисует её сам. Линиями — надёжно, но файл в несколько раз крупнее; "
+                    "штриховкой AutoCAD — один объект на контур."))
+        add(self, QgsProcessingParameterCrs(
+            self.CRS, self.tr("Система координат"), defaultValue="ProjectCrs"),
+            self.tr("Координаты пишутся в неё без смещений; рядом с DXF кладётся файл .prj."))
+        add(self, QgsProcessingParameterBoolean(
+            self.SELECTED_FEATURES_ONLY, self.tr("Только выделенные объекты"),
+            defaultValue=False),
+            self.tr("Выгрузится только то, что выделено на карте. Если не выделено ничего, "
+                    "модуль об этом скажет."))
+        add(self, QgsProcessingParameterEnum(
             self.SYMBOLOGY_MODE, self.tr("Перенос стилей"),
             [self.tr("Без стилей"), self.tr("Стили объектов"), self.tr("Стили слоёв символов")],
-            defaultValue=1))
-        self.addParameter(QgsProcessingParameterScale(
-            self.SYMBOLOGY_SCALE, self.tr("Масштаб для стилей и подписей"), defaultValue=1000))
+            defaultValue=1),
+            self.tr("«Стили объектов» подходит почти всегда. «Стили слоёв символов» дробит "
+                    "сложные символы на части — файл крупнее."), advanced=True)
+        add(self, QgsProcessingParameterScale(
+            self.SYMBOLOGY_SCALE, self.tr("Масштаб для стилей и подписей"), defaultValue=1000),
+            self.tr("От него зависят толщины линий, шаг штриховки и размер подписей в "
+                    "чертеже: 1:1000 — как выглядит карта в этом масштабе."), advanced=True)
         encodings = QgsDxfExport.encodings()
         # в QGIS 4 список записан в нижнем регистре («cp1251»), поэтому без учёта регистра
         default = next((i for i, e in enumerate(encodings) if e.lower() == "cp1251"), 0)
-        self.addParameter(QgsProcessingParameterEnum(
-            self.ENCODING, self.tr("Кодировка"), encodings, defaultValue=default))
-        self.addParameter(QgsProcessingParameterCrs(
-            self.CRS, self.tr("Система координат"), defaultValue="ProjectCrs"))
-        self.addParameter(QgsProcessingParameterBoolean(
-            self.SELECTED_FEATURES_ONLY, self.tr("Только выделенные объекты"), defaultValue=False))
-        self.addParameter(QgsProcessingParameterBoolean(
+        add(self, QgsProcessingParameterEnum(
+            self.ENCODING, self.tr("Кодировка"), encodings, defaultValue=default),
+            self.tr("CP1251 — обычная кодировка русских чертежей AutoCAD."), advanced=True)
+        add(self, QgsProcessingParameterBoolean(
             self.USE_LAYER_TITLE, self.tr("Имя слоя AutoCAD — заголовок слоя QGIS, а не имя"),
-            defaultValue=False))
-        self.addParameter(QgsProcessingParameterBoolean(
-            self.FORCE_2D, self.tr("Только 2D (без высот Z)"), defaultValue=False))
-        self.addParameter(QgsProcessingParameterBoolean(
-            self.MTEXT, self.tr("Подписи многострочным текстом (MTEXT)"), defaultValue=True))
-        self.addParameter(QgsProcessingParameterBoolean(
-            self.ATTRIBUTES_VISIBLE, self.tr("Показывать атрибуты на чертеже"), defaultValue=False))
-        self.addParameter(QgsProcessingParameterBoolean(
-            self.WRITE_PRJ, self.tr("Записать файл .prj с системой координат"), defaultValue=True))
-        self.addParameter(QgsProcessingParameterFileDestination(
-            self.OUTPUT, self.tr("Файл DXF"), self.tr("Файлы DXF (*.dxf)")))
+            defaultValue=False),
+            self.tr("Заголовок задаётся в свойствах слоя, на вкладке «Информация о QGIS "
+                    "сервере»."), advanced=True)
+        add(self, QgsProcessingParameterBoolean(
+            self.FORCE_2D, self.tr("Только 2D (без высот Z)"), defaultValue=False),
+            advanced=True)
+        add(self, QgsProcessingParameterBoolean(
+            self.MTEXT, self.tr("Подписи многострочным текстом (MTEXT)"), defaultValue=True),
+            self.tr("Если AutoCAD показывает подписи не так, как ожидалось, попробуйте "
+                    "выключить — подписи станут обычным текстом (TEXT)."), advanced=True)
+        add(self, QgsProcessingParameterBoolean(
+            self.ATTRIBUTES_VISIBLE, self.tr("Показывать атрибуты на чертеже"),
+            defaultValue=False),
+            self.tr("По умолчанию атрибуты скрыты: они видны в «Свойствах» объекта и "
+                    "извлекаются командой ИЗВЛЕЧЬДАННЫЕ, но не загромождают чертёж."),
+            advanced=True)
+        add(self, QgsProcessingParameterBoolean(
+            self.WRITE_PRJ, self.tr("Записать файл .prj с системой координат"),
+            defaultValue=True), advanced=True)
+        add(self, QgsProcessingParameterFileDestination(
+            self.OUTPUT, self.tr("Файл DXF"), self.tr("Файлы DXF (*.dxf)")),
+            self.tr("Открывается в AutoCAD как есть; рядом кладётся файл .prj с системой "
+                    "координат. Формат DXF 2000, при необходимости сохраните его в AutoCAD "
+                    "как DWG."))
 
     def prepareAlgorithm(self, parameters, context, feedback):
         """Копии слоёв готовятся в основном потоке: слои проекта читаются здесь."""
@@ -545,6 +576,10 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
             feedback.reportError(self.tr(
                 "Значений длиннее {} символов укорочено: {}").format(
                     dxf_blocks.MAX_VALUE_LEN, result.truncated))
+        if is_temporary(path):
+            feedback.pushWarning(self.tr(
+                "Файл записан во временную папку и пропадёт при очистке временных файлов. "
+                "Чтобы отдать чертёж в работу, запустите снова, указав постоянный путь."))
         feedback.setProgress(100)
         self._jobs = []
         return {self.OUTPUT: path}

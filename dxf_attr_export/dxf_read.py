@@ -9,7 +9,9 @@ GDAL разворачивает вставки блоков (INSERT) в их ф�
 Модуль не зависит от QGIS: на вход — путь к файлу.
 """
 
-from .dxf_blocks import read_codec
+import codecs
+
+from .dxf_blocks import python_codec
 
 # Длинное значение атрибута пишется кусками: код 3 — начало, код 1 — конец.
 _CHUNK_CODE = "3"
@@ -38,6 +40,7 @@ class ReadResult:
 
 
 BINARY_SENTINEL = b"AutoCAD Binary DXF"
+CHUNK = 1 << 20  # по мегабайту за раз
 # Единичные сбои UTF-8 прощаются только в файле, где много нерусского ASCII
 # текста: иначе на чертеже с тремя русскими буквами CP1251 сойдёт за UTF-8.
 MIN_NON_ASCII = 1000
@@ -46,8 +49,11 @@ MAX_BROKEN_SHARE = 0.001
 
 def file_kind(path):
     """Что это за файл: «dxf», «dxf-binary», «dwg» или «unknown»."""
-    with open(path, "rb") as f:
-        head = f.read(32)
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+    except OSError:  # папка, нет прав, файл исчез — разберётся вызывающий
+        return "unknown"
     if head.startswith(BINARY_SENTINEL):
         return "dxf-binary"
     if head[:2] == b"AC" and head[2:6].isdigit():
@@ -55,19 +61,17 @@ def file_kind(path):
     return "dxf" if head.lstrip()[:1].isdigit() else "unknown"
 
 
-def _pairs(text):
-    """Текст DXF → пары (код, значение). Код — строка без пробелов."""
-    lines = [ln.rstrip("\r") for ln in text.split("\n")]
-    for i in range(0, len(lines) - 1, 2):
-        yield lines[i].strip(), lines[i + 1]
-
-
-def read_file(path, encoding="CP1251"):
-    """Прочитать файл и отдать его текст вместе с распознанной кодировкой."""
-    with open(path, "rb") as f:
-        data = f.read()
-    codec = read_codec(data, encoding)
-    return data.decode(codec, errors="replace"), codec
+def _pairs(path, codec):
+    """Файл DXF → пары (код, значение), построчно, не загружая его целиком."""
+    with open(path, "r", encoding=codec, errors="replace") as f:
+        while True:
+            code = f.readline()
+            if not code:
+                return
+            value = f.readline()
+            if not value:
+                return
+            yield code.strip(), value.rstrip("\n")
 
 
 def detect_encoding(path, declared="CP1251"):
@@ -79,15 +83,23 @@ def detect_encoding(path, declared="CP1251"):
 
     Единичные сбои допускаются: длинное значение DXF режется на куски по
     числу байтов, и разрыв попадает в середину двухбайтового символа.
+    Файл читается кусками — чертежи бывают в сотни мегабайт.
     """
     if file_kind(path) != "dxf":
         return declared
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    plain = bytes(range(128))
+    non_ascii = broken = 0
     with open(path, "rb") as f:
-        data = f.read()
-    if data.isascii():
+        while True:
+            chunk = f.read(CHUNK)
+            if not chunk:
+                break
+            non_ascii += len(chunk.translate(None, plain))
+            broken += decoder.decode(chunk).count("\ufffd")
+    broken += decoder.decode(b"", True).count("\ufffd")
+    if non_ascii == 0:
         return declared
-    non_ascii = len(data.translate(None, bytes(range(128))))
-    broken = data.decode("utf-8", errors="replace").count("\ufffd")
     if broken == 0:
         return "UTF-8"
     if non_ascii >= MIN_NON_ASCII and broken <= non_ascii * MAX_BROKEN_SHARE:
@@ -117,11 +129,10 @@ def insert_attributes(path, encoding="CP1251"):
     BLOCKS) значений не содержат. У двоичного DXF атрибуты не читаются —
     результат пустой.
     """
-    result_empty = ReadResult()
-    if file_kind(path) != "dxf":
-        return result_empty
-    text, codec = read_file(path, encoding)
     result = ReadResult()
+    if file_kind(path) != "dxf":
+        return result
+    codec = python_codec(encoding)
     result.encoding = codec
     in_entities = False
     section = False  # следующий код 2 — имя раздела
@@ -157,7 +168,7 @@ def insert_attributes(path, encoding="CP1251"):
             return None
         return current
 
-    for code, value in _pairs(text):
+    for code, value in _pairs(path, codec):
         if code == "0":
             if kind is not None and in_entities:
                 current = finish()

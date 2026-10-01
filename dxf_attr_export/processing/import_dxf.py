@@ -38,6 +38,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import QCoreApplication
 
 from .. import dxf_read
+from .params import add, is_temporary
 
 # Поля, которые получает каждый слой. Имена латиницей — как и в остальных модулях.
 BASE_FIELDS = ["dxf_layer", "entity", "handle", "block", "linetype", "text"]
@@ -48,14 +49,14 @@ LABEL_JOIN = "; "  # подписи, попавшие в один полигон
 MAX_BOUND_LABELS = 3
 
 LABEL_MODES = [
-    "Привязать к полигонам, остальные — отдельным слоем",
+    "Привязать к полигонам",
     "Отдельным слоем точек",
     "Не загружать",
 ]
 BIND_LABELS, LABELS_APART, NO_LABELS = 0, 1, 2
 BLOCK_MODES = [
-    "Одним объектом (как в AutoCAD)",
-    "Разобрать на отдельные фигуры",
+    "Одним объектом",
+    "Разобрать на фигуры",
 ]
 ENCODINGS = ["Определить по файлу", "CP1251", "UTF-8", "CP866", "KOI8-R"]
 AUTO_ENCODING = 0
@@ -192,13 +193,45 @@ def free_name(name, used):
     return out
 
 
+class Extent:
+    """Охват чертежа: нужен, чтобы заметить несуразную систему координат."""
+
+    def __init__(self):
+        self.x_min = self.y_min = None
+        self.x_max = self.y_max = None
+
+    def add(self, box):
+        x_min, x_max, y_min, y_max = box
+        if self.x_min is None:
+            self.x_min, self.x_max, self.y_min, self.y_max = x_min, x_max, y_min, y_max
+            return
+        self.x_min = min(self.x_min, x_min)
+        self.x_max = max(self.x_max, x_max)
+        self.y_min = min(self.y_min, y_min)
+        self.y_max = max(self.y_max, y_max)
+
+    def largest(self):
+        """Наибольшая по модулю координата: (x, y)."""
+        if self.x_min is None:
+            return (0.0, 0.0)
+        return (max(abs(self.x_min), abs(self.x_max)),
+                max(abs(self.y_min), abs(self.y_max)))
+
+    def beyond_degrees(self):
+        """Координаты заведомо не градусы?"""
+        if self.x_min is None:
+            return False
+        x, y = self.largest()
+        return x > 180 or y > 90
+
+
 class Group:
     """Будущий слой: имя, вид геометрии, поля, число объектов."""
 
-    def __init__(self, name, kind, has_z):
+    def __init__(self, name, kind, has_z=False):
         self.name = name
         self.kind = kind
-        self.has_z = has_z
+        self.has_z = has_z  # хоть у одного объекта есть Z — слой объёмный
         self.tags = []  # теги атрибутов блоков, в порядке появления
         self.field_of = {}  # тег атрибута → имя поля
         self.fields = list(BASE_FIELDS)
@@ -253,33 +286,56 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
         )
 
     def initAlgorithm(self, config=None):
-        self.addParameter(QgsProcessingParameterFile(
+        add(self, QgsProcessingParameterFile(
             self.INPUT, self.tr("Чертёж DXF"),
             # «все файлы» нужны, чтобы выбранный DWG дошёл до нашего понятного
             # отказа, а не был отвергнут Processing как «неверное значение»
-            fileFilter=self.tr("Чертежи DXF (*.dxf *.DXF);;Все файлы (*.*)")))
-        self.addParameter(QgsProcessingParameterCrs(
-            self.CRS, self.tr("Система координат чертежа"), defaultValue="ProjectCrs"))
-        self.addParameter(QgsProcessingParameterBoolean(
-            self.CLOSED_AS_POLYGON, self.tr("Замкнутые полилинии — полигонами"),
-            defaultValue=True))
-        self.addParameter(QgsProcessingParameterEnum(
+            fileFilter=self.tr("Чертежи DXF (*.dxf *.DXF);;Все файлы (*.*)")),
+            self.tr("Только DXF. Чертёж DWG откройте в AutoCAD и сохраните как DXF."))
+        add(self, QgsProcessingParameterCrs(
+            self.CRS, self.tr("Система координат чертежа"), defaultValue="ProjectCrs"),
+            self.tr("В самом DXF системы координат нет, поэтому её нужно знать и выбрать: "
+                    "по умолчанию подставлена СК проекта. Если выбрать не ту, слои лягут "
+                    "не на место."))
+        add(self, QgsProcessingParameterEnum(
             self.LABELS, self.tr("Подписи чертежа"), options=LABEL_MODES,
-            defaultValue=BIND_LABELS))
-        self.addParameter(QgsProcessingParameterBoolean(
-            self.BLOCK_ATTRS, self.tr("Атрибуты блоков — в поля таблицы"), defaultValue=True))
-        self.addParameter(QgsProcessingParameterEnum(
-            self.BLOCKS, self.tr("Вставки блоков"), options=BLOCK_MODES, defaultValue=0))
-        self.addParameter(QgsProcessingParameterBoolean(
+            defaultValue=BIND_LABELS),
+            self.tr("«Привязать к полигонам»: подпись попадает в поле «text» наименьшего "
+                    "контура, внутрь которого легла; объект, собравший больше трёх подписей, "
+                    "не получает ни одной — это чужой текст внутри контура. Непривязанные "
+                    "подписи всё равно сохраняются отдельным слоем точек."))
+        add(self, QgsProcessingParameterBoolean(
             self.SPLIT_BY_LAYER, self.tr("Отдельный слой на каждый слой чертежа"),
-            defaultValue=True))
-        self.addParameter(QgsProcessingParameterBoolean(
-            self.KEEP_Z, self.tr("Сохранять высоты (Z)"), defaultValue=False))
-        self.addParameter(QgsProcessingParameterEnum(
+            defaultValue=True),
+            self.tr("Иначе весь чертёж ляжет в три слоя — точки, линии и полигоны."))
+        add(self, QgsProcessingParameterBoolean(
+            self.CLOSED_AS_POLYGON, self.tr("Замкнутые полилинии — полигонами"),
+            defaultValue=True),
+            self.tr("Иначе контуры участков и зон останутся линиями, и площадь по ним "
+                    "не посчитать."), advanced=True)
+        add(self, QgsProcessingParameterBoolean(
+            self.BLOCK_ATTRS, self.tr("Атрибуты блоков — в поля таблицы"), defaultValue=True),
+            self.tr("Имена полей берутся из имён атрибутов блока (NOMER, ТИП). "
+                    "Без этого значения атрибутов попадут в чертёж подписями."), advanced=True)
+        add(self, QgsProcessingParameterEnum(
+            self.BLOCKS, self.tr("Вставки блоков"), options=BLOCK_MODES, defaultValue=0),
+            self.tr("«Одним объектом» — вставка блока становится одной записью таблицы, как "
+                    "она и выглядит в AutoCAD. «Разобрать на фигуры» — каждая фигура внутри "
+                    "блока отдельной записью; объектов станет в разы больше."), advanced=True)
+        add(self, QgsProcessingParameterBoolean(
+            self.KEEP_Z, self.tr("Сохранять высоты (Z)"), defaultValue=False),
+            self.tr("Высоты из чертежа редко бывают осмысленными, поэтому по умолчанию "
+                    "слои плоские."), advanced=True)
+        add(self, QgsProcessingParameterEnum(
             self.ENCODING, self.tr("Кодировка текста"), options=ENCODINGS,
-            defaultValue=AUTO_ENCODING))
-        self.addParameter(QgsProcessingParameterFileDestination(
-            self.OUTPUT, self.tr("GeoPackage"), fileFilter="GeoPackage (*.gpkg)"))
+            defaultValue=AUTO_ENCODING),
+            self.tr("Обычно определяется сама по содержимому файла. Задавать вручную стоит, "
+                    "только если имена слоёв или подписи пришли кракозябрами."), advanced=True)
+        add(self, QgsProcessingParameterFileDestination(
+            self.OUTPUT, self.tr("GeoPackage со слоями чертежа"),
+            fileFilter="GeoPackage (*.gpkg)"),
+            self.tr("Один файл, внутри — по слою на каждый слой чертежа и вид геометрии. "
+                    "Слои сразу добавляются в проект."))
 
     def processAlgorithm(self, parameters, context, feedback):
         try:
@@ -327,14 +383,16 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             ds = self.open_drawing(gdal, path)
             layer = ds.GetLayer(0)
             marks = (attrib_handles, label_handles)
-            groups, labels = self.scan(ogr, layer, marks, attrs, label_mode,
-                                       split, keep_z, closed, feedback)
+            groups, labels, extent = self.scan(ogr, layer, marks, attrs, label_mode,
+                                               split, keep_z, closed, feedback)
+            self.check_coordinates(crs, extent, feedback)
             if not groups and not labels:
                 raise QgsProcessingException(self.tr("В чертеже нет объектов с геометрией"))
-            written = self.write(ogr, osr, layer, out_path, crs, groups, labels, attrs,
+            written = self.write(gdal, ogr, osr, layer, out_path, crs, groups, labels, attrs,
                                  marks, label_mode, split, keep_z, closed, feedback)
             ds = None
 
+        self.check_temporary(out_path, feedback)
         for name in written:
             uri = "{}|layername={}".format(out_path, name)
             context.addLayerToLoadOnCompletion(
@@ -388,6 +446,25 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
                 "Рядом с чертежом есть .prj с системой координат «{}» — она не совпадает "
                 "с выбранной «{}»").format(other.description(), crs.description()))
 
+    def check_temporary(self, out_path, feedback):
+        """Сказать, если GeoPackage попал во временную папку: он пропадёт."""
+        if is_temporary(out_path):
+            feedback.pushWarning(self.tr(
+                "GeoPackage записан во временную папку и пропадёт при очистке временных "
+                "файлов, а слои в проекте перестанут открываться. Чтобы сохранить: "
+                "правый щелчок по слою → «Экспорт» → «Сохранить объекты как…», или "
+                "запустите снова, указав постоянный файл."))
+
+    def check_coordinates(self, crs, extent, feedback):
+        """Предупредить, если координаты чертежа не вяжутся с выбранной СК."""
+        if crs.isGeographic() and extent.beyond_degrees():
+            x, y = extent.largest()
+            feedback.pushWarning(self.tr(
+                "Координаты чертежа доходят до ({:.0f}, {:.0f}) — это метры, а выбрана СК "
+                "в градусах «{}». Слои лягут не на место: выберите систему координат "
+                "чертежа (МСК, UTM, Гаусса-Крюгера)."
+            ).format(x, y, crs.description()))
+
     def open_drawing(self, gdal, path):
         try:
             ds = gdal.OpenEx(path, gdal.OF_VECTOR)
@@ -400,9 +477,10 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
     # — первый проход —
 
     def scan(self, ogr, layer, marks, attrs, label_mode, split, keep_z, closed, feedback):
-        """Какие слои получатся, какие у них поля и где подписи."""
+        """Какие слои получатся, какие у них поля, где подписи и каков охват чертежа."""
         groups = {}
         labels = []
+        extent = Extent()
         layer.ResetReading()
         total = max(layer.GetFeatureCount(), 1)
         for n, feature in enumerate(layer):
@@ -417,6 +495,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             geom = feature.GetGeometryRef()
             if geom is None or geom.IsEmpty():
                 continue
+            extent.add(geom.GetEnvelope())
             dxf_layer = feature.GetFieldAsString("Layer")
             if is_label(sub, handle, marks[1]):
                 if label_mode == NO_LABELS:
@@ -427,22 +506,26 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
                 continue
             info = attrs.get(handle)
             for kind, parts in split_by_kind(ogr, geom, closed).items():
-                has_z = keep_z and any(p.Is3D() for p in parts)
-                group = self.group_for(groups, dxf_layer, kind, has_z, split)
+                group = self.group_for(groups, dxf_layer, kind, split)
                 group.count += 1
+                if keep_z and any(p.Is3D() for p in parts):
+                    group.has_z = True  # высоты есть хоть у одного объекта — слой объёмный
                 if info is not None:
                     for tag, _value in info.values:
                         if tag not in group.tags:
                             group.tags.append(tag)
-        return groups, labels
+        return groups, labels, extent
 
-    def group_for(self, groups, dxf_layer, kind, has_z, split, create=True):
-        """Группа (будущий слой) для вида геометрии; при `create` создаёт новую."""
-        key = (dxf_layer if split else "", kind, has_z)
+    def group_for(self, groups, dxf_layer, kind, split, create=True):
+        """Группа (будущий слой) для вида геометрии; при `create` создаёт новую.
+
+        Высоты в ключ не входят: иначе слой чертежа, где часть объектов плоская,
+        а часть с Z, разъехался бы на два слоя с номером в имени.
+        """
+        key = (dxf_layer if split else "", kind)
         group = groups.get(key)
         if group is None and create:
-            group = groups[key] = Group(
-                layer_name(dxf_layer if split else "Чертёж", kind), kind, has_z)
+            group = groups[key] = Group(layer_name(dxf_layer if split else "Чертёж", kind), kind)
         return group
 
     # — привязка подписей —
@@ -485,7 +568,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
 
     # — второй проход —
 
-    def write(self, ogr, osr, layer, out_path, crs, groups, labels, attrs, marks,
+    def write(self, gdal, ogr, osr, layer, out_path, crs, groups, labels, attrs, marks,
               label_mode, split, keep_z, closed, feedback):
         """Объекты в GeoPackage, подписи — в полигоны или отдельным слоем."""
         index, label_rows = self.label_index(labels)
@@ -494,7 +577,9 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
         bound = {}
         if label_mode == BIND_LABELS and index is not None:
             bound = self.bindings(ogr, layer, index, label_rows, marks, closed, feedback)
-        out_ds, srs = self.create_output(ogr, osr, out_path, crs)
+        if feedback.isCanceled():
+            return []  # отменили на привязке — файл не создаём
+        out_ds, srs = self.create_output(gdal, ogr, osr, out_path, crs, feedback)
         types = ogr_types(ogr)
         names = []
         used = set()
@@ -505,7 +590,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             flat, with_z = types[group.kind]
             group.layer = out_ds.CreateLayer(
                 group.name, srs, with_z if group.has_z else flat,
-                ["GEOMETRY_NAME=geom", "SPATIAL_INDEX=YES"])
+                ["GEOMETRY_NAME=geom", "SPATIAL_INDEX=YES", "OVERWRITE=YES"])
             if group.layer is None:
                 raise QgsProcessingException(
                     self.tr("Слой «{}» не создался в GeoPackage").format(group.name))
@@ -535,8 +620,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             # у штриховки в поле Text GDAL держит имя узора, а не подпись
             own_text = "" if entity == "HATCH" else feature.GetFieldAsString("Text")
             for kind, parts in split_by_kind(ogr, geom, closed).items():
-                has_z = keep_z and any(p.Is3D() for p in parts)
-                group = self.group_for(groups, dxf_layer, kind, has_z, split, create=False)
+                group = self.group_for(groups, dxf_layer, kind, split, create=False)
                 if group is None or group.layer is None:
                     continue
                 out_geom = self.one_geometry(ogr, parts, group, types)
@@ -571,13 +655,31 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
         out_ds = None  # закрывает GeoPackage
         return names
 
-    def create_output(self, ogr, osr, out_path, crs):
+    def create_output(self, gdal, ogr, osr, out_path, crs, feedback):
+        """Создать GeoPackage или открыть существующий, не тронув чужие слои."""
         driver = ogr.GetDriverByName("GPKG")
         if driver is None:
             raise QgsProcessingException(self.tr("В GDAL нет записи GeoPackage"))
+        out_ds = None
         if os.path.exists(out_path):
-            driver.DeleteDataSource(out_path)
-        out_ds = driver.CreateDataSource(out_path)
+            try:
+                out_ds = gdal.OpenEx(out_path, gdal.OF_VECTOR | gdal.OF_UPDATE)
+            except Exception:
+                out_ds = None
+            if out_ds is None:
+                raise QgsProcessingException(self.tr(
+                    "Файл «{}» уже есть, и это не GeoPackage. Укажите другой файл."
+                ).format(os.path.basename(out_path)))
+            existing = out_ds.GetLayerCount()
+            if existing:
+                feedback.pushWarning(self.tr(
+                    "Файл «{}» уже существует, слоёв в нём: {}. Слои чертежа будут "
+                    "добавлены, одноимённые — заменены, остальные останутся как были."
+                ).format(os.path.basename(out_path), existing))
+        else:
+            # CreateDataSource, а не Create: у драйвера OGR в GDAL 3.3.2 (QGIS 3.40)
+            # метода Create нет
+            out_ds = driver.CreateDataSource(out_path)
         if out_ds is None:
             raise QgsProcessingException(
                 self.tr("Не удалось создать файл «{}»").format(out_path))
@@ -639,7 +741,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
         """Подписи, не попавшие ни в один полигон, — отдельным слоем точек."""
         name = free_name(layer_name("Подписи", POINT), used)
         layer = out_ds.CreateLayer(name, srs, ogr.wkbPoint,
-                                   ["GEOMETRY_NAME=geom", "SPATIAL_INDEX=YES"])
+                                   ["GEOMETRY_NAME=geom", "SPATIAL_INDEX=YES", "OVERWRITE=YES"])
         if layer is None:
             raise QgsProcessingException(
                 self.tr("Слой «{}» не создался в GeoPackage").format(name))
