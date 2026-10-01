@@ -428,7 +428,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             info = attrs.get(handle)
             for kind, parts in split_by_kind(ogr, geom, closed).items():
                 has_z = keep_z and any(p.Is3D() for p in parts)
-                group = self.group(groups, dxf_layer, kind, has_z, split)
+                group = self.group_for(groups, dxf_layer, kind, has_z, split)
                 group.count += 1
                 if info is not None:
                     for tag, _value in info.values:
@@ -436,7 +436,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
                             group.tags.append(tag)
         return groups, labels
 
-    def group(self, groups, dxf_layer, kind, has_z, split, create=True):
+    def group_for(self, groups, dxf_layer, kind, has_z, split, create=True):
         """Группа (будущий слой) для вида геометрии; при `create` создаёт новую."""
         key = (dxf_layer if split else "", kind, has_z)
         group = groups.get(key)
@@ -536,7 +536,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             own_text = "" if entity == "HATCH" else feature.GetFieldAsString("Text")
             for kind, parts in split_by_kind(ogr, geom, closed).items():
                 has_z = keep_z and any(p.Is3D() for p in parts)
-                group = self.group(groups, dxf_layer, kind, has_z, split, create=False)
+                group = self.group_for(groups, dxf_layer, kind, has_z, split, create=False)
                 if group is None or group.layer is None:
                     continue
                 out_geom = self.one_geometry(ogr, parts, group, types)

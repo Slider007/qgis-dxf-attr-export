@@ -893,6 +893,60 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(read.attrib_handles, {"F1"})
 
 
+class AlgorithmApiTest(unittest.TestCase):
+    """Методы, которые QGIS вызывает сам: панель инструментов, подсказки, значки.
+
+    Внутренний метод, названный как метод Processing, перекрывает его, и QGIS
+    падает ещё при построении списка алгоритмов, а проверками через `processing.run`
+    это не видно.
+    """
+
+    # эти методы Processing переопределять с обязательными аргументами можно
+    OVERRIDES = {"initAlgorithm", "processAlgorithm", "prepareAlgorithm",
+                 "postProcessAlgorithm", "checkParameterValues"}
+    # QGIS зовёт их без аргументов
+    CALLED_BY_QGIS = ("name", "displayName", "group", "groupId", "shortHelpString",
+                      "shortDescription", "tags", "flags", "icon", "svgIconPath",
+                      "helpUrl", "createInstance")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plugin = DxfAttrExportPlugin(None)
+        cls.plugin.initProcessing()
+
+    @classmethod
+    def tearDownClass(cls):
+        QgsApplication.processingRegistry().removeProvider(cls.plugin.provider)
+
+    def test_both_algorithms_registered(self):
+        ids = sorted(a.id() for a in self.plugin.provider.algorithms())
+        self.assertEqual(ids, [ALG, IMPORT_ALG])
+
+    def test_methods_qgis_calls_itself(self):
+        for alg in self.plugin.provider.algorithms():
+            for name in self.CALLED_BY_QGIS:
+                with self.subTest(алгоритм=alg.name(), метод=name):
+                    getattr(alg, name)()
+            self.assertTrue(alg.group(), alg.name())
+            self.assertTrue(alg.displayName(), alg.name())
+
+    def test_no_processing_method_shadowed(self):
+        """Свой метод не должен подменять метод Processing."""
+        import inspect
+        from qgis.core import QgsProcessingAlgorithm
+        for alg in self.plugin.provider.algorithms():
+            for name, func in vars(type(alg)).items():
+                if name.startswith("_") or name in self.OVERRIDES or not callable(func):
+                    continue
+                if getattr(QgsProcessingAlgorithm, name, None) is None:
+                    continue
+                params = list(inspect.signature(func).parameters.values())[1:]
+                required = [p for p in params
+                            if p.default is p.empty and p.kind is p.POSITIONAL_OR_KEYWORD]
+                self.assertEqual(required, [], "{}.{} подменяет метод Processing".format(
+                    type(alg).__name__, name))
+
+
 class PluginTest(unittest.TestCase):
     def test_load_unload(self):
         iface = Iface()
