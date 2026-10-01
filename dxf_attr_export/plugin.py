@@ -13,6 +13,7 @@ except ImportError:  # Qt5 / QGIS 3
 
 PLUGIN_DIR = os.path.dirname(__file__)
 ALGORITHM_ID = "dxfattrexport:exportdxf"
+IMPORT_ALGORITHM_ID = "dxfattrexport:importdxf"
 
 
 def visible_vector_layers(project):
@@ -25,6 +26,7 @@ class DxfAttrExportPlugin:
     def __init__(self, iface):
         self.iface = iface
         self.action = None
+        self.import_action = None
         self.provider = None
 
     def initProcessing(self):
@@ -33,23 +35,27 @@ class DxfAttrExportPlugin:
 
     def initGui(self):
         self.initProcessing()
-        self.action = QAction(
-            QIcon(os.path.join(PLUGIN_DIR, "icon.svg")),
-            "Экспорт в DXF с атрибутами…",
-            self.iface.mainWindow(),
-        )
+        icon = QIcon(os.path.join(PLUGIN_DIR, "icon.svg"))
+        self.action = QAction(icon, "Экспорт в DXF с атрибутами…", self.iface.mainWindow())
         self.action.setToolTip(
             "Выгрузить слои в DXF для AutoCAD: стили, подписи и атрибуты объектов в блоках")
         self.action.triggered.connect(self.run)
-        altan_toolbar.add_action(self.iface, self.action)
-        altan_toolbar.add_to_menu(self.iface, self.action)
+        self.import_action = QAction(icon, "Импорт DXF в ГИС-формат…", self.iface.mainWindow())
+        self.import_action.setToolTip(
+            "Прочитать чертёж DXF: слои AutoCAD — отдельными слоями, атрибуты блоков — полями")
+        self.import_action.triggered.connect(self.run_import)
+        for action in (self.action, self.import_action):
+            altan_toolbar.add_action(self.iface, action)
+            altan_toolbar.add_to_menu(self.iface, action)
 
     def unload(self):
-        if self.action:
-            altan_toolbar.remove_from_menu(self.iface, self.action)
-            altan_toolbar.remove_action(self.iface, self.action)
-            self.action.deleteLater()
-            self.action = None
+        for name in ("action", "import_action"):
+            action = getattr(self, name)
+            if action:
+                altan_toolbar.remove_from_menu(self.iface, action)
+                altan_toolbar.remove_action(self.iface, action)
+                action.deleteLater()
+                setattr(self, name, None)
         if self.provider:
             QgsApplication.processingRegistry().removeProvider(self.provider)
             self.provider = None
@@ -66,3 +72,7 @@ class DxfAttrExportPlugin:
                        for lyr in layers],
             "CRS": project.crs(),
         })
+
+    def run_import(self):
+        import processing
+        processing.execAlgorithmDialog(IMPORT_ALGORITHM_ID, {"CRS": QgsProject.instance().crs()})

@@ -656,6 +656,243 @@ class Iface:
         self.menu.remove((m, a.text()))
 
 
+# ---------- чертежи для импорта: пишутся руками, как их пишет чужая программа
+
+IMPORT_ALG = "dxfattrexport:importdxf"
+
+
+def dxf_text(entities, blocks=(), codepage="ANSI_1251"):
+    """Минимальный DXF из пар «код — значение»."""
+    def sec(name, body):
+        return ["0", "SECTION", "2", name] + list(body) + ["0", "ENDSEC"]
+    out = (sec("HEADER", ["9", "$ACADVER", "1", "AC1015", "9", "$DWGCODEPAGE", "3", codepage])
+           + sec("BLOCKS", blocks) + sec("ENTITIES", entities) + ["0", "EOF"])
+    return "\r\n".join(out) + "\r\n"
+
+
+def write_dxf(name, entities, blocks=(), codepage="ANSI_1251", encoding="cp1251"):
+    path = os.path.join(OUT, name)
+    with open(path, "wb") as f:
+        f.write(dxf_text(entities, blocks, codepage).encode(encoding))
+    return path
+
+
+def tag_poly(handle, layer, pts, closed=True):
+    tags = ["0", "LWPOLYLINE", "5", handle, "8", layer, "100", "AcDbEntity",
+            "100", "AcDbPolyline", "90", str(len(pts)), "70", "1" if closed else "0"]
+    for x, y in pts:
+        tags += ["10", repr(float(x)), "20", repr(float(y))]
+    return tags
+
+
+def tag_text(handle, layer, x, y, value):
+    return ["0", "TEXT", "5", handle, "8", layer,
+            "10", repr(float(x)), "20", repr(float(y)), "40", "2.5", "1", value]
+
+
+def tag_insert(handle, layer, x, y, block, attribs=()):
+    tags = ["0", "INSERT", "5", handle, "8", layer, "66", "1" if attribs else "0",
+            "2", block, "10", repr(float(x)), "20", repr(float(y))]
+    for i, (tag, value) in enumerate(attribs):
+        tags += ["0", "ATTRIB", "5", "{}A{}".format(handle, i), "8", layer,
+                 "10", repr(float(x)), "20", repr(float(y)), "40", "2.5",
+                 "1", value, "2", tag, "70", "1"]
+    if attribs:
+        tags += ["0", "SEQEND", "5", "{}S".format(handle), "8", layer]
+    return tags
+
+
+def tag_block(name, handle, shapes):
+    return (["0", "BLOCK", "5", handle, "8", "0", "2", name, "70", "0",
+             "10", "0.0", "20", "0.0", "3", name, "1", ""] + list(shapes)
+            + ["0", "ENDBLK", "5", handle + "E", "8", "0"])
+
+
+SQUARE = [(0, 0), (100, 0), (100, 100), (0, 100)]
+
+
+def read_gpkg(path):
+    """GeoPackage → {имя слоя: [{поле: значение, "wkt": …, "type": …}]}."""
+    ds = ogr.Open(path)
+    assert ds is not None, path
+    out = {}
+    for i in range(ds.GetLayerCount()):
+        layer = ds.GetLayer(i)
+        rows = []
+        for feature in layer:
+            row = dict(feature.items())
+            geom = feature.GetGeometryRef()
+            row["wkt"] = geom.ExportToWkt() if geom else None
+            rows.append(row)
+        out[layer.GetName()] = {
+            "rows": rows,
+            "type": ogr.GeometryTypeToName(layer.GetGeomType()),
+            "crs": (layer.GetSpatialRef().GetAuthorityCode(None)
+                    if layer.GetSpatialRef() else None),
+            "fields": [layer.GetLayerDefn().GetFieldDefn(n).GetName()
+                       for n in range(layer.GetLayerDefn().GetFieldCount())],
+        }
+        layer.ResetReading()
+    ds = None
+    return out
+
+
+class ImportTest(unittest.TestCase):
+    """Чтение чертежа: слои, атрибуты блоков, подписи, кодировка."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plugin = DxfAttrExportPlugin(None)
+        cls.plugin.initProcessing()
+        cls.path = write_dxf(
+            "import_src.dxf",
+            tag_poly("100", "Границы", SQUARE)
+            + tag_poly("101", "Дороги", [(0, 200), (100, 220)], closed=False)
+            + tag_text("102", "Подписи", 50, 50, "ЗОУИТ-1")
+            + tag_insert("110", "Опоры", 300, 50, "ОПОРА", [("NOMER", "17"), ("ТИП", "анкерная")]),
+            tag_block("ОПОРА", "120", tag_poly("121", "Опоры", [(-2, -2), (2, -2), (2, 2), (-2, 2)])))
+
+    @classmethod
+    def tearDownClass(cls):
+        QgsApplication.processingRegistry().removeProvider(cls.plugin.provider)
+
+    def run_import(self, name, path=None, **params):
+        out = os.path.join(OUT, name)
+        values = {"INPUT": path or self.path, "CRS": CRS, "OUTPUT": out}
+        values.update(params)
+        processing.run(IMPORT_ALG, values)
+        return read_gpkg(out)
+
+    def test_layer_per_dxf_layer_and_kind(self):
+        """Отдельный слой на каждый слой чертежа и вид геометрии, с выбранной СК."""
+        got = self.run_import("imp_basic.gpkg")
+        self.assertEqual(sorted(got), ["Границы (полигоны)", "Дороги (линии)", "Опоры (полигоны)"])
+        self.assertEqual(got["Границы (полигоны)"]["type"], "Multi Polygon")
+        self.assertEqual(got["Дороги (линии)"]["type"], "Multi Line String")
+        self.assertEqual(got["Границы (полигоны)"]["crs"], CRS.split(":")[1])
+        self.assertEqual(got["Границы (полигоны)"]["rows"][0]["wkt"],
+                         "MULTIPOLYGON (((0 0,100 0,100 100,0 100,0 0)))")
+        self.assertEqual(got["Дороги (линии)"]["rows"][0]["wkt"],
+                         "MULTILINESTRING ((0 200,100 220))")
+
+    def test_block_attributes_become_fields(self):
+        """Атрибуты блока — поля таблицы, а не отдельные подписи."""
+        got = self.run_import("imp_attrs.gpkg")["Опоры (полигоны)"]
+        row = got["rows"][0]
+        self.assertEqual(row["block"], "ОПОРА")
+        self.assertEqual(row["nomer"], "17")
+        self.assertEqual(row["тип"], "анкерная")
+        # значения атрибутов не должны остаться ещё и подписями
+        self.assertNotIn("Подписи (точки)", self.run_import("imp_attrs2.gpkg"))
+
+    def test_attributes_can_be_switched_off(self):
+        got = self.run_import("imp_noattrs.gpkg", BLOCK_ATTRS=False)["Опоры (полигоны)"]
+        self.assertNotIn("nomer", got["fields"])
+        self.assertIsNone(got["rows"][0]["block"])
+
+    def test_label_goes_into_polygon(self):
+        """Подпись внутри полигона попадает в его поле text."""
+        got = self.run_import("imp_label.gpkg")
+        self.assertEqual(got["Границы (полигоны)"]["rows"][0]["text"], "ЗОУИТ-1")
+        self.assertNotIn("Подписи (точки)", got)
+
+    def test_many_labels_stay_apart(self):
+        """Много подписей в одном контуре — это чужой текст: привязки нет."""
+        path = write_dxf("imp_many.dxf", tag_poly("100", "Границы", SQUARE)
+                         + [t for i in range(4)
+                            for t in tag_text("20{}".format(i), "Подписи", 10 + i * 10, 50,
+                                              "точка {}".format(i))])
+        got = self.run_import("imp_many.gpkg", path=path)
+        self.assertEqual(got["Границы (полигоны)"]["rows"][0]["text"], None)
+        self.assertEqual(len(got["Подписи (точки)"]["rows"]), 4)
+
+    def test_labels_as_separate_layer(self):
+        got = self.run_import("imp_labels_apart.gpkg", LABELS=1)
+        self.assertEqual(got["Границы (полигоны)"]["rows"][0]["text"], None)
+        self.assertEqual([r["text"] for r in got["Подписи (точки)"]["rows"]], ["ЗОУИТ-1"])
+
+    def test_labels_can_be_skipped(self):
+        got = self.run_import("imp_nolabels.gpkg", LABELS=2)
+        self.assertNotIn("Подписи (точки)", got)
+        self.assertEqual(got["Границы (полигоны)"]["rows"][0]["text"], None)
+
+    def test_closed_polyline_as_line(self):
+        """Без галочки замкнутая полилиния остаётся линией."""
+        got = self.run_import("imp_lines.gpkg", CLOSED_AS_POLYGON=False)
+        self.assertIn("Границы (линии)", got)
+        self.assertNotIn("Границы (полигоны)", got)
+
+    def test_single_layer_when_not_split(self):
+        got = self.run_import("imp_one.gpkg", SPLIT_BY_LAYER=False)
+        self.assertEqual(sorted(got), ["Чертёж (линии)", "Чертёж (полигоны)"])
+        rows = got["Чертёж (полигоны)"]["rows"]
+        self.assertEqual(sorted(r["dxf_layer"] for r in rows), ["Границы", "Опоры"])
+
+    def test_layer_name_with_special_first_char(self):
+        """Имя таблицы GeoPackage начинается с буквы: «!РКЗ» → «_!РКЗ»."""
+        path = write_dxf("imp_bang.dxf", tag_poly("100", "!РКЗ", SQUARE))
+        got = self.run_import("imp_bang.gpkg", path=path)
+        self.assertEqual(sorted(got), ["_!РКЗ (полигоны)"])
+        self.assertEqual(got["_!РКЗ (полигоны)"]["rows"][0]["dxf_layer"], "!РКЗ")
+
+    def test_utf8_file_with_cp1251_header(self):
+        """Конвертеры DWG→DXF пишут UTF-8, объявляя CP1251: имена не должны стать кракозябрами."""
+        path = write_dxf("imp_utf8.dxf",
+                         tag_poly("100", "Границы зон", SQUARE)
+                         + tag_text("102", "Подписи", 50, 50, "ЗОУИТ-Ё"),
+                         codepage="ANSI_1251", encoding="utf-8")
+        got = self.run_import("imp_utf8.gpkg", path=path)
+        self.assertIn("Границы зон (полигоны)", got)
+        self.assertEqual(got["Границы зон (полигоны)"]["rows"][0]["text"], "ЗОУИТ-Ё")
+
+    def test_dwg_is_refused_with_explanation(self):
+        from qgis.core import QgsProcessingException
+        path = os.path.join(OUT, "imp_fake.dwg")
+        with open(path, "wb") as f:
+            f.write(b"AC1032\x00\x00" + b"\x00" * 200)
+        with self.assertRaises(QgsProcessingException) as caught:
+            self.run_import("imp_dwg.gpkg", path=path)
+        self.assertIn("DWG", str(caught.exception))
+        self.assertIn("DXF", str(caught.exception))
+
+    def test_round_trip_keeps_attributes(self):
+        """Выгрузка и чтение обратно: значения полей возвращаются полями."""
+        layer = make_layer("Point", "Опоры", "field=name:string&field=kind:string",
+                           [("POINT(400000 6000000)", ["Опора №1", "анкерная"])])
+        QgsProject.instance().addMapLayer(layer)
+        try:
+            dxf = os.path.join(OUT, "round.dxf")
+            processing.run(ALG, {"LAYERS": layers_param((layer, -1)), "CRS": CRS, "OUTPUT": dxf})
+            got = self.run_import("round.gpkg", path=dxf)
+        finally:
+            QgsProject.instance().removeMapLayer(layer.id())
+        # значок точки выгружается фигурами, поэтому вид геометрии не важен
+        names = [n for n in got if n.startswith("Опоры")]
+        self.assertEqual(len(names), 1, sorted(got))
+        rows = got[names[0]]["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "Опора №1")
+        self.assertEqual(rows[0]["kind"], "анкерная")
+        self.assertEqual(rows[0]["block"], "Опоры_1")
+
+    def test_attribute_value_in_chunks(self):
+        """Длинное значение атрибута пишется кусками (код 3) — склеивается обратно."""
+        from dxf_attr_export import dxf_read
+        tags = ["0", "SECTION", "2", "ENTITIES",
+                "0", "INSERT", "5", "F0", "8", "Слой", "66", "1", "2", "БЛОК",
+                "10", "0.0", "20", "0.0",
+                "0", "ATTRIB", "5", "F1", "8", "Слой", "10", "0.0", "20", "0.0",
+                "3", "начало ", "3", "середина ", "1", "конец", "2", "NOTE", "70", "0",
+                "0", "SEQEND", "5", "F2", "8", "Слой", "0", "ENDSEC", "0", "EOF"]
+        path = os.path.join(OUT, "chunks.dxf")
+        with open(path, "wb") as f:
+            f.write(("\r\n".join(["0", "SECTION", "2", "HEADER", "9", "$ACADVER",
+                                   "1", "AC1015", "0", "ENDSEC"] + tags) + "\r\n").encode("cp1251"))
+        read = dxf_read.insert_attributes(path)
+        self.assertEqual(read.inserts["F0"].values, [("NOTE", "начало середина конец")])
+        self.assertEqual(read.attrib_handles, {"F1"})
+
+
 class PluginTest(unittest.TestCase):
     def test_load_unload(self):
         iface = Iface()
@@ -665,8 +902,11 @@ class PluginTest(unittest.TestCase):
         self.assertIsNotNone(registry.algorithmById(ALG))
         bars = [b for b in iface.window.findChildren(QToolBar) if b.objectName() == "AltanEcoToolbar"]
         self.assertEqual(len(bars), 1)
-        self.assertEqual([a.text() for a in bars[0].actions()], ["Экспорт в DXF с атрибутами…"])
-        self.assertEqual(iface.menu, [("&Альтан-Эко", "Экспорт в DXF с атрибутами…")])
+        self.assertIsNotNone(registry.algorithmById(IMPORT_ALG))
+        self.assertEqual([a.text() for a in bars[0].actions()],
+                         ["Экспорт в DXF с атрибутами…", "Импорт DXF в ГИС-формат…"])
+        self.assertEqual(iface.menu, [("&Альтан-Эко", "Экспорт в DXF с атрибутами…"),
+                                      ("&Альтан-Эко", "Импорт DXF в ГИС-формат…")])
         plugin.unload()
         app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.assertIsNone(registry.providerById("dxfattrexport"))

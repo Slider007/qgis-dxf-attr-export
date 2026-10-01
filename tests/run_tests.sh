@@ -14,13 +14,14 @@ fi
 [ -d "$APP" ] || { echo "QGIS не найден, укажите QGIS_APP=/путь/к/QGIS.app"; exit 1; }
 C="$APP/Contents"
 PY="$C/MacOS/bin/python3"
+export QGIS_PREFIX_PATH="$C/MacOS"
 if [ ! -x "$PY" ]; then
   PY=$(ls "$C/MacOS"/python3.* 2>/dev/null | head -1)
-  # у новых сборок стандартная библиотека Python лежит в Contents/Frameworks
-  export PYTHONHOME="$C/Frameworks"
+  # у новых сборок стандартная библиотека Python лежит в Contents/Frameworks,
+  # а префикс QGIS — само приложение: иначе не найдутся провайдеры (CSV, облака точек, WMS…)
+  export PYTHONHOME="$C/Frameworks" QGIS_PREFIX_PATH="$APP"
 fi
 [ -x "$PY" ] || { echo "Не найден python внутри $APP"; exit 1; }
-export QGIS_PREFIX_PATH="$C/MacOS"
 QPY="$C/Resources/python"
 [ -d "$QPY" ] || QPY="$C/Resources/qgis/python"   # так устроены сборки 3.44+ и 4.x
 export PYTHONPATH="$QPY${PYTHONPATH:+:$PYTHONPATH}"
