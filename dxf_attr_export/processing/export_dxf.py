@@ -288,17 +288,20 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
             "Оформление в блоках: полное (как на карте QGIS: заливки, значки, толщины) "
             "или только границы — полигоны замкнутыми полилиниями по каждому контуру, "
             "линии полилиниями, точки точками AutoCAD, цветом обводки символа.\n\n"
-            "Слой AutoCAD — имя слоя QGIS или значение поля, выбранного в столбце "
-            "«Output layer attribute» списка слоёв.\n\n"
+            "Слой AutoCAD — имя слоя QGIS или значение поля, выбранного для слоя "
+            "в списке слоёв (кнопка «…» справа от поля «Слои»).\n\n"
             "Координаты пишутся в выбранной системе координат без смещений. Рядом с "
             "DXF создаётся файл .prj с описанием системы координат.\n\n"
             "Длинные значения (больше 250 символов) укорачиваются, о них выводится "
-            "предупреждение.")
+            "предупреждение.\n\n"
+            "Если у проекта нет метровой системы координат, при открытии окна МСК подставляется "
+            "по месту на карте: сервису адресов OpenStreetMap отправляются приблизительные "
+            "координаты центра карты (с точностью около 100 м).")
 
     def initAlgorithm(self, config=None):
         add(self, QgsProcessingParameterDxfLayers(self.LAYERS, self.tr("Слои")),
-            self.tr("В столбце «Output layer attribute» можно выбрать поле, значение "
-                    "которого станет именем слоя AutoCAD, — например тип опоры."))
+            self.tr("Кнопка «…» открывает список слоёв: для каждого слоя там можно выбрать поле, "
+                    "значение которого станет именем слоя AutoCAD, — например тип опоры."))
         add(self, QgsProcessingParameterEnum(
             self.BLOCK_CONTENT, self.tr("Оформление в блоках"),
             [self.tr("Полное оформление QGIS"),
@@ -366,6 +369,47 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
             self.tr("Открывается в AutoCAD как есть; рядом кладётся файл .prj с системой "
                     "координат. Формат DXF 2000, при необходимости сохраните его в AutoCAD "
                     "как DWG."))
+
+    def write_prj(self, path, crs, dxf_existed, feedback):
+        """Описание СК рядом с DXF.
+
+        Файл `.prj` с таким же именем мог остаться от другого слоя (например, шейп-файла): если
+        DXF создаётся впервые, чужой `.prj` не перезаписывается, а человеку об этом говорится.
+        Если DXF уже был, `.prj` рядом — его пара, и он обновляется вместе с чертежом.
+        """
+        prj = os.path.splitext(path)[0] + ".prj"
+        wkt = crs.toWkt(Qgis.CrsWktVariant.Wkt1Esri)
+        try:
+            if os.path.exists(prj) and not dxf_existed:
+                with open(prj, "r", encoding="utf-8", errors="replace") as f:
+                    if f.read().strip() != wkt.strip():
+                        feedback.pushWarning(self.tr(
+                            "Рядом уже лежит «{}» — он остался без изменений, поэтому у этого DXF нет "
+                            "файла с системой координат.\n"
+                            "Переименуйте один из файлов и выгрузите снова, если .prj нужен.").format(os.path.basename(prj)))
+                        return
+            with open(prj, "w", encoding="utf-8") as f:
+                f.write(wkt)
+        except OSError as e:
+            feedback.pushWarning(self.tr(
+                "Не удалось записать «{}»: {}. Сам DXF выгружен.").format(
+                    os.path.basename(prj), e.strerror or e))
+
+    def check_memory(self, path, feedback):
+        """Большой DXF разбирается в памяти целиком: заранее говорим, чем это кончится."""
+        size = os.path.getsize(path)
+        ram = dxf_blocks.physical_memory()
+        need = size * dxf_blocks.MEMORY_FACTOR
+        if ram and need > ram * dxf_blocks.MEMORY_SHARE:
+            raise QgsProcessingException(self.tr(
+                "Файл DXF слишком большой, чтобы записать в него атрибуты: {:.0f} МБ, нужно около "
+                "{:.1f} ГБ памяти, а на компьютере {:.1f} ГБ.\n"
+                "Файл сохранён без атрибутов. Выгрузите меньше слоёв за раз или выберите «Только границы "
+                "объектов» — файл получится меньше.").format(size / 2 ** 20, need / 2 ** 30, ram / 2 ** 30))
+        if size > dxf_blocks.BIG_FILE:
+            feedback.pushWarning(self.tr(
+                "Файл DXF большой ({:.0f} МБ): запись атрибутов займёт несколько минут и около "
+                "{:.1f} ГБ памяти. Не закрывайте QGIS.").format(size / 2 ** 20, need / 2 ** 30))
 
     def prepareAlgorithm(self, parameters, context, feedback):
         """Копии слоёв готовятся в основном потоке: слои проекта читаются здесь."""
@@ -534,6 +578,14 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
         export.setExtent(extent)
         if not mtext:
             export.setFlags(QgsDxfExport.Flag.FlagNoMText)
+        dxf_existed = os.path.exists(path)  # нужен для .prj: чей файл рядом, наш прежний или чужой
+        folder = os.path.dirname(path)
+        if folder and not os.path.isdir(folder):
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError:
+                raise QgsProcessingException(self.tr(
+                    "Не удалось создать папку «{}». Выберите другое место для файла DXF").format(folder))
         out = QFile(path)
         if not out.open(QIODevice.OpenModeFlag.WriteOnly | QIODevice.OpenModeFlag.Truncate):
             raise QgsProcessingException(self.tr("Не удалось сохранить «{}». Возможно, файл открыт в другой программе — закройте её и повторите").format(path))
@@ -549,10 +601,19 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr("Запись атрибутов в блоки…"))
         factor = QgsUnitTypes.fromUnitToUnitFactor(Qgis.DistanceUnit.Meters, crs.mapUnits())
         text_height = 0.0025 * scale * factor
+        self.check_memory(path, feedback)
         try:
             result = dxf_blocks.add_attribute_blocks(
                 path, encoding, blocks_layers, text_height=text_height, visible=visible,
                 insunits=INSUNITS.get(crs.mapUnits()))
+        except MemoryError:
+            raise QgsProcessingException(self.tr(
+                "Не хватило памяти, чтобы записать атрибуты в блоки. Файл DXF сохранён без атрибутов. "
+                "Выгрузите меньше слоёв за раз или выберите «Только границы объектов»."))
+        except OSError as e:
+            raise QgsProcessingException(self.tr(
+                "Не удалось записать атрибуты в «{}»: {}. Возможно, файл открыт в другой программе — "
+                "закройте её и повторите. Файл DXF остался без атрибутов.").format(path, e.strerror or e))
         except ValueError as e:
             # разбор DXF, записанного QGIS: до человека это должно дойти словами,
             # а не трассировкой
@@ -562,26 +623,28 @@ class ExportDxfAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgress(95)
 
         if write_prj:
-            prj = os.path.splitext(path)[0] + ".prj"
-            with open(prj, "w", encoding="utf-8") as f:
-                f.write(crs.toWkt(Qgis.CrsWktVariant.Wkt1Esri))
+            self.write_prj(path, crs, dxf_existed, feedback)
 
         feedback.pushInfo(self.tr("Объектов записано блоками с атрибутами: {}").format(result.blocks))
         for name, count in sorted(missing_fills.items()):
-            feedback.reportError(self.tr(
-                "Заливка «{}» в DXF не переносится (объектов: {}) — остаётся только контур").format(
+            feedback.pushWarning(self.tr(
+                "Заливка «{}» в DXF не переносится (объектов: {}) — остаётся только контур. "
+                "Чтобы заливка попала в чертёж, возьмите в стиле слоя «Простую заливку».").format(
                     name, count))
         if too_dense:
-            feedback.reportError(self.tr(
-                "У {} объектов шаг штриховки слишком мелкий для их площади — штриховка пропущена").format(
+            feedback.pushWarning(self.tr(
+                "У {} объектов штриховка пропущена: шаг слишком мелкий для их площади.\n"
+                "Увеличьте расстояние между линиями в стиле слоя или выберите «Штриховкой AutoCAD — "
+                "компактнее».").format(
                     too_dense))
         if result.without_geometry:
-            feedback.reportError(self.tr(
-                "Объектов без геометрии или не попавших в DXF: {} — они не выгружены").format(
+            feedback.pushWarning(self.tr(
+                "Не выгружено объектов: {} — у них нет геометрии или QGIS не записал для них фигур в DXF. "
+                "Если они нужны в чертеже, проверьте их геометрию в слое.").format(
                     result.without_geometry))
         if result.truncated:
-            feedback.reportError(self.tr(
-                "Значений длиннее {} символов укорочено: {}").format(
+            feedback.pushWarning(self.tr(
+                "Укорочено значений длиннее {} символов: {}. В слое QGIS они остались целыми.").format(
                     dxf_blocks.MAX_VALUE_LEN, result.truncated))
         if is_temporary(path):
             feedback.pushWarning(self.tr(

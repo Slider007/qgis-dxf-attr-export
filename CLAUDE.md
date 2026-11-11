@@ -51,6 +51,17 @@
   Если у проекта уже метровая СК (`needs_msk` — ложь), она и берётся: подменять
   осознанный выбор нельзя. Веб-Меркатор (EPSG:3857) считается непригодным — с ним
   открывают подложки.
+- Выгрузка (1.3.2, находки «Правила проверки» от 2026-10-01): `.prj` пишет `write_prj` — чужой
+  `.prj` при **новом** DXF не перезаписывается (предупреждение), при перезаписи **своего** DXF обновляется
+  (`dxf_existed` — файл был до выгрузки); `check_memory` перед `add_attribute_blocks` сверяет размер DXF ×
+  `MEMORY_FACTOR` (17 — замер на 20 000 объектов, 32 МБ → 548 МБ Python-памяти) с долей оперативной памяти и
+  отказывает по-русски, а `BIG_FILE` (100 МБ) только предупреждает; ветка `physical_memory()` для Windows
+  (`GlobalMemoryStatusEx`) на настоящей Windows **не проверялась**; запись DXF — через `.part` и `os.replace`;
+  `plugin.default_output()` — «Выгрузка DXF» рядом с проектом, имя с датой и временем (чтобы не затереть
+  доработанный в AutoCAD файл), папку создаёт алгоритм. Предупреждения — `pushWarning`, не `reportError`.
+- `msk.py`: запрос к сервису адресов идёт с тремя знаками после запятой (~100 м, zoom=5 — регион), решение
+  пользователя от 2026-10-01; правится в `qgis-project-utm-crs`, копии в `dxf_attr_export` и
+  `corner_points_catalog` — на следующем их выпуске.
 - `processing/params.py` — `add()` вешает на параметр подсказку (`setHelp`) и флаг
   «Дополнительно»; `is_temporary()` узнаёт файл во временной папке Processing.
   В окне видно только то, что нужно решить; проверка `AlgorithmApiTest` следит,
@@ -87,7 +98,7 @@
   нужен `PYTHONHOME=Contents/Frameworks`, python QGIS в `Contents/Resources/qgis/python`.
   `tests/run_tests.sh` это учитывает; другая версия — `QGIS_APP=…`.
 - Проверка в настоящем QGIS: `QGIS --profiles-path <tmp> --code check.py`, плагин
-  включается в `<tmp>/profiles/default/qgis.org/QGIS3.ini`. Окно алгоритма модальное:
+  включается в `<tmp>/profiles/default/qgis.org/QGIS3.ini` (QGIS 4 читает `QGIS4.ini` — `scripts/temp_profile.sh` навыка пишет оба). Окно алгоритма модальное:
   закрывать его таймером, найдя через `QApplication.activeModalWidget()`.
   Только **с экраном**: с `QT_QPA_PLATFORM=offscreen` QGIS падает (139) ещё до
   выполнения `--code` — проверено на 3.40 и 3.44 (это общая грабля, см. навык).

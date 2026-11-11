@@ -92,7 +92,9 @@ def _request(lon, lat):
     """Запрос к Nominatim с собственным сроком ожидания."""
     url = QUrl(NOMINATIM)
     query = QUrlQuery()
-    for key, value in (("lat", "%.6f" % lat), ("lon", "%.6f" % lon), ("format", "jsonv2"),
+    # Три знака после запятой — около 100 м. Для определения субъекта (zoom=5, регион) этого
+    # достаточно, а закрытый объект не уходит во внешний сервис с точностью до сантиметров.
+    for key, value in (("lat", "%.3f" % lat), ("lon", "%.3f" % lon), ("format", "jsonv2"),
                        ("zoom", "5"), ("accept-language", "ru")):
         query.addQueryItem(key, value)
     url.setQuery(query)

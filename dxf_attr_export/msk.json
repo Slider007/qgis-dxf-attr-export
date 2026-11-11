@@ -2040,5 +2040,21 @@
   "zone": 4,
   "variant": "6-градусная",
   "proj": "+proj=tmerc +lat_0=0 +lon_0=81 +k=1 +x_0=4500000 +y_0=-11057.63 +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22 +units=m +no_defs"
+ },
+ {
+  "name": "МСК-90 зона 1 Республика Крым",
+  "code": 90,
+  "subject": "Республика Крым",
+  "zone": 1,
+  "variant": "",
+  "proj": "+proj=tmerc +lat_0=0 +lon_0=32.5 +k=1 +x_0=4300000 +y_0=-9214.692 +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22 +units=m +no_defs"
+ },
+ {
+  "name": "МСК-90 зона 2 Республика Крым",
+  "code": 90,
+  "subject": "Республика Крым",
+  "zone": 2,
+  "variant": "",
+  "proj": "+proj=tmerc +lat_0=0 +lon_0=35.5 +k=1 +x_0=5300000 +y_0=-9214.692 +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22 +units=m +no_defs"
  }
 ]

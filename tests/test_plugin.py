@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 from qgis.PyQt.QtCore import QCoreApplication, QSettings  # noqa: E402
 
 PROFILE = os.path.join(HERE, "_profile")
-OUT = os.path.join(HERE, "_out")
+OUT = os.path.join(HERE, "_out", "test")  # tests/_out/check — логи полной проверки, их тесты не трогают
 shutil.rmtree(PROFILE, ignore_errors=True)
 shutil.rmtree(OUT, ignore_errors=True)
 os.makedirs(OUT)
@@ -42,6 +42,7 @@ from qgis.core import (  # noqa: E402
     QgsLinePatternFillSymbolLayer,
     QgsMarkerSymbol,
     QgsPalLayerSettings,
+    QgsProcessingException,
     QgsProcessingFeedback,
     QgsProcessingParameterDxfLayers,
     QgsProject,
@@ -604,15 +605,19 @@ class PatternFillTest(unittest.TestCase):
         symbol.changeSymbolLayer(0, QgsGradientFillSymbolLayer(QColor(255, 0, 0), QColor(0, 0, 255)))
         layer.renderer().setSymbol(symbol)
         QgsProject.instance().addMapLayer(layer)
-        errors = []
+        errors, warnings_ = [], []
 
         class Feedback(QgsProcessingFeedback):
             def reportError(self, error, fatalError=False):
                 errors.append(error)
 
+            def pushWarning(self, text):
+                warnings_.append(text)
+
         processing.run(ALG, {"LAYERS": layers_param((layer, -1)), "CRS": CRS,
                             "OUTPUT": os.path.join(OUT, "gradient.dxf")}, feedback=Feedback())
-        self.assertTrue(any("градиент" in e for e in errors), errors)
+        self.assertTrue(any("градиент" in w for w in warnings_), warnings_)
+        self.assertEqual(errors, [], "незагруженная заливка — предупреждение, а не красная ошибка")
 
 
 class HelpersTest(unittest.TestCase):
@@ -1258,6 +1263,231 @@ class MskPrefillTest(unittest.TestCase):
         self.assertEqual(crs, QgsProject.instance().crs())
         self.assertIsNone(name)
         self.assertIsNone(problem)
+
+
+class SafetyTest(unittest.TestCase):
+    """Находки «Правила проверки» 2026-10-01 (F1–F6): молчаливая перезапись `.prj`, красные
+    предупреждения, большой файл, временный файл по умолчанию, обрыв записи, точность координат."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plugin = DxfAttrExportPlugin(None)
+        cls.plugin.initProcessing()
+
+    @classmethod
+    def tearDownClass(cls):
+        QgsApplication.processingRegistry().removeProvider(cls.plugin.provider)
+
+    def setUp(self):
+        self.layer = make_layer("Point", "Опоры", "field=name:string",
+                                [("POINT(400000 6000000)", ["Опора №1"])])
+        QgsProject.instance().addMapLayer(self.layer)
+        os.makedirs(OUT, exist_ok=True)
+        import tempfile
+        self.dir = tempfile.mkdtemp(dir=OUT)
+
+    def tearDown(self):
+        QgsProject.instance().removeMapLayer(self.layer.id())
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def run_export(self, path, crs=CRS, feedback=None):
+        return processing.run(ALG, {"LAYERS": layers_param((self.layer, -1)), "CRS": crs,
+                                    "OUTPUT": path}, feedback=feedback or Collector())
+
+    # --- F1: чужой .prj
+
+    def test_foreign_prj_is_not_overwritten(self):
+        path = os.path.join(self.dir, "участок.dxf")
+        prj = os.path.join(self.dir, "участок.prj")
+        with open(prj, "w", encoding="utf-8") as f:
+            f.write('PROJCS["чужая"]')
+        collector = Collector()
+        self.run_export(path, feedback=collector)
+        with open(prj, encoding="utf-8") as f:
+            self.assertEqual(f.read(), 'PROJCS["чужая"]', "чужой .prj затёрт без предупреждения")
+        self.assertTrue(any("Рядом уже лежит" in w for w in collector.warnings), collector.warnings)
+        self.assertTrue(os.path.exists(path), "сам DXF должен быть выгружен")
+
+    def test_prj_follows_its_own_dxf(self):
+        path = os.path.join(self.dir, "чертёж.dxf")
+        self.run_export(path, crs="EPSG:32637")
+        collector = Collector()
+        self.run_export(path, crs="EPSG:32638", feedback=collector)  # повторная выгрузка поверх своей
+        with open(os.path.join(self.dir, "чертёж.prj"), encoding="utf-8") as f:
+            self.assertIn("UTM_Zone_38N", f.read(), "у переписанного DXF должен быть свежий .prj")
+        self.assertFalse(any("Рядом уже лежит" in w for w in collector.warnings), collector.warnings)
+
+    def test_equal_prj_is_not_a_conflict(self):
+        path = os.path.join(self.dir, "тот же.dxf")
+        self.run_export(path)
+        os.remove(path)  # .prj остался и совпадает с тем, что был бы записан
+        collector = Collector()
+        self.run_export(path, feedback=collector)
+        self.assertFalse(any("Рядом уже лежит" in w for w in collector.warnings), collector.warnings)
+
+    # --- F2: предупреждения — не ошибки
+
+    def test_notes_are_warnings_not_errors(self):
+        layer = make_layer("Point", "Длинные", "field=note:string(1000)", [("POINT(0 0)", [LONG])])
+        QgsProject.instance().addMapLayer(layer)
+        errors, warnings_ = [], []
+
+        class Feedback(QgsProcessingFeedback):
+            def reportError(self, error, fatalError=False):
+                errors.append(error)
+
+            def pushWarning(self, text):
+                warnings_.append(text)
+
+        try:
+            processing.run(ALG, {"LAYERS": layers_param((layer, -1)), "CRS": CRS,
+                                 "OUTPUT": os.path.join(self.dir, "long.dxf")}, feedback=Feedback())
+        finally:
+            QgsProject.instance().removeMapLayer(layer.id())
+        self.assertEqual(errors, [], "укороченное значение — не ошибка, красным его выводить нельзя")
+        self.assertTrue(any("Укорочено значений" in w for w in warnings_), warnings_)
+
+    # --- F3: большой файл
+
+    def test_huge_file_is_refused_before_reading(self):
+        path = os.path.join(self.dir, "big.dxf")
+        original = dxf_blocks.physical_memory
+        dxf_blocks.physical_memory = lambda: 1000  # «на компьютере килобайт»: любой файл не поместится
+        try:
+            with self.assertRaises(QgsProcessingException) as caught:
+                self.run_export(path)
+        finally:
+            dxf_blocks.physical_memory = original
+        self.assertIn("слишком большой", str(caught.exception))
+        self.assertIn("сохранён без атрибутов", str(caught.exception))
+        with open(path, "rb") as f:
+            self.assertNotIn(b"ATTRIB", f.read(), "DXF должен остаться обычным, без атрибутов")
+
+    def test_memory_error_is_explained(self):
+        original = dxf_blocks.add_attribute_blocks
+
+        def out_of_memory(*args, **kwargs):
+            raise MemoryError()
+
+        dxf_blocks.add_attribute_blocks = out_of_memory
+        try:
+            with self.assertRaises(QgsProcessingException) as caught:
+                self.run_export(os.path.join(self.dir, "mem.dxf"))
+        finally:
+            dxf_blocks.add_attribute_blocks = original
+        self.assertIn("Не хватило памяти", str(caught.exception))
+
+    def test_big_file_warns(self):
+        saved = dxf_blocks.BIG_FILE, dxf_blocks.physical_memory
+        dxf_blocks.BIG_FILE, dxf_blocks.physical_memory = 1, lambda: 0
+        collector = Collector()
+        try:
+            self.run_export(os.path.join(self.dir, "warn.dxf"), feedback=collector)
+        finally:
+            dxf_blocks.BIG_FILE, dxf_blocks.physical_memory = saved
+        self.assertTrue(any("Файл DXF большой" in w for w in collector.warnings), collector.warnings)
+        quiet = Collector()
+        self.run_export(os.path.join(self.dir, "quiet.dxf"), feedback=quiet)
+        self.assertFalse(any("большой" in w for w in quiet.warnings), "маленький файл не должен пугать")
+
+    # --- F4: куда сохранять по умолчанию
+
+    def test_default_output_next_to_project(self):
+        from datetime import datetime
+        from dxf_attr_export.plugin import default_output
+        project = QgsProject.instance()
+        was = project.fileName()
+        try:
+            project.setFileName("")
+            self.assertIsNone(default_output(project), "у несохранённого проекта остаётся временный файл")
+            project.setFileName(os.path.join(self.dir, "Кирилловская.qgz"))
+            first = default_output(project, datetime(2026, 10, 1, 21, 30))
+            second = default_output(project, datetime(2026, 10, 1, 21, 31))
+        finally:
+            project.setFileName(was)
+        self.assertEqual(first, os.path.join(self.dir, "Выгрузка DXF", "Кирилловская 2026-10-01 21-30.dxf"))
+        self.assertNotEqual(first, second, "новая выгрузка не должна затирать прежнюю")
+
+    def test_missing_folder_is_created(self):
+        path = os.path.join(self.dir, "новая", "папка", "x.dxf")
+        self.run_export(path)
+        self.assertTrue(os.path.exists(path))
+
+    # --- F5: обрыв записи
+
+    def test_failed_write_keeps_previous_file(self):
+        path = os.path.join(self.dir, "x.dxf")
+        self.run_export(path)
+        with open(path, "rb") as f:
+            self.assertIn(b"ATTRIB", f.read())
+        original = os.replace
+
+        def broken(src, dst):
+            raise OSError(13, "нет доступа")
+
+        os.replace = broken
+        try:
+            with self.assertRaises(QgsProcessingException) as caught:
+                self.run_export(path)
+        finally:
+            os.replace = original
+        self.assertIn("Не удалось записать атрибуты", str(caught.exception))
+        self.assertFalse(os.path.exists(path + ".part"), "временный файл остался")
+        with open(path, "rb") as f:
+            data = f.read()
+        self.assertIn(b"ENTITIES", data, "от DXF осталась половина")
+        self.assertNotIn(b"ATTRIB", data)
+
+    # --- F6: координаты для сервиса адресов
+
+    def test_coordinates_sent_to_service_are_rounded(self):
+        from dxf_attr_export import msk
+        url = msk._request(38.123456, 55.987654).url().toString()
+        self.assertIn("lat=55.988", url)
+        self.assertIn("lon=38.123", url)
+        self.assertNotIn("55.987654", url, "лишняя точность уходит во внешний сервис")
+        self.assertNotIn("38.123456", url)
+
+    def test_help_tells_about_the_service(self):
+        registry = QgsApplication.processingRegistry()
+        for alg in (ALG, IMPORT_ALG):
+            self.assertIn("OpenStreetMap", registry.algorithmById(alg).shortHelpString(), alg)
+
+
+class DefaultFileTest(unittest.TestCase):
+    """F4: окно выгрузки открывается с файлом рядом с проектом, а не временным."""
+
+    def setUp(self):
+        import tempfile
+        os.makedirs(OUT, exist_ok=True)
+        self.dir = tempfile.mkdtemp(dir=OUT)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_window_gets_default_file(self):
+        import processing as processing_module
+        project = QgsProject.instance()
+        was_file, was_crs = project.fileName(), project.crs()
+        project.setFileName(os.path.join(self.dir, "Проект.qgz"))
+        project.setCrs(QgsCoordinateReferenceSystem(CRS))  # метровая СК: в сеть за МСК не ходим
+        iface = Iface()
+        plugin = dxf_attr_export.classFactory(iface)
+        plugin.initGui()
+        opened = []
+        original = processing_module.execAlgorithmDialog
+        processing_module.execAlgorithmDialog = lambda alg, params: opened.append(params)
+        try:
+            plugin.run()
+        finally:
+            processing_module.execAlgorithmDialog = original
+            plugin.unload()
+            app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            project.setFileName(was_file)
+            project.setCrs(was_crs)
+        self.assertEqual(len(opened), 1)
+        self.assertIn("OUTPUT", opened[0], "окно открылось с временным файлом по умолчанию")
+        self.assertTrue(opened[0]["OUTPUT"].startswith(os.path.join(self.dir, "Выгрузка DXF")), opened[0]["OUTPUT"])
 
 
 class PluginTest(unittest.TestCase):

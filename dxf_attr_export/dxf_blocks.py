@@ -13,10 +13,41 @@ DXF для каждого объекта (например, «QFX_12»), а зд
 """
 
 import codecs
+import os
 
 # Символы, недопустимые в именах слоёв и блоков AutoCAD
 _BAD_NAME_CHARS = set('<>/\\":;?*|=`,')
 MAX_VALUE_LEN = 250
+
+# Запись атрибутов разбирает DXF целиком в памяти. Замер 2026-10-01 (20 000 объектов, файл 32 МБ):
+# пик Python-памяти около 17 размеров файла. Когда памяти не хватает, ОС может закрыть сам QGIS
+# вместе с несохранённой работой, поэтому большой файл проверяется заранее.
+MEMORY_FACTOR = 17
+MEMORY_SHARE = 0.6               # больше этой доли оперативной памяти не отдаём
+BIG_FILE = 100 * 1024 * 1024     # с такого размера предупреждаем, что будет долго и тяжело
+
+
+def physical_memory():
+    """Оперативная память компьютера в байтах; 0 — узнать не удалось (тогда защита молчит)."""
+    try:
+        if os.name == "nt":  # в Windows нет os.sysconf; ветка не проверялась на настоящей Windows
+            import ctypes
+
+            class Status(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
+                            ("total_phys", ctypes.c_ulonglong), ("avail_phys", ctypes.c_ulonglong),
+                            ("total_page", ctypes.c_ulonglong), ("avail_page", ctypes.c_ulonglong),
+                            ("total_virtual", ctypes.c_ulonglong), ("avail_virtual", ctypes.c_ulonglong),
+                            ("avail_ext", ctypes.c_ulonglong)]
+
+            status = Status()
+            status.length = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.total_phys)
+            return 0
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        return 0
 
 # Сущности, которые пишутся вслед за основной и принадлежат ей
 _SUB_ENTITIES = {"VERTEX", "SEQEND", "ATTRIB"}
@@ -492,6 +523,17 @@ def add_attribute_blocks(path, encoding, layers, text_height=2.5, visible=False,
         _header_set(header, "$INSUNITS", "70", "{:>6}".format(insunits))
 
     data = doc.text().encode(codec, errors="replace")
-    with open(path, "wb") as f:
-        f.write(data)
+    # сначала во временный файл рядом, потом подмена: сбой посреди записи не оставит
+    # от чертежа половину, а прежний файл останется целым
+    part = path + ".part"
+    try:
+        with open(part, "wb") as f:
+            f.write(data)
+        os.replace(part, path)
+    except BaseException:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise
     return result

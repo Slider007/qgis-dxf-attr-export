@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 
 from qgis.core import (
     Qgis,
@@ -91,6 +92,19 @@ def drawing_crs(canvas, project):
     return found, zones[0]["name"], None
 
 
+def default_output(project, now=None):
+    """Куда по умолчанию сохранять DXF: папка «Выгрузка DXF» рядом с проектом.
+
+    В имя входит дата и время, чтобы новая выгрузка не затёрла прежнюю: её могли успеть
+    доработать в AutoCAD. Проект не сохранён — None: тогда остаётся временный файл Processing.
+    """
+    folder = project.absolutePath()
+    if not folder:
+        return None
+    stamp = (now or datetime.now()).strftime("%Y-%m-%d %H-%M")
+    return os.path.join(folder, "Выгрузка DXF", "{} {}.dxf".format(project.baseName() or "Чертёж", stamp))
+
+
 def visible_vector_layers(project):
     """Включённые в дереве слоёв векторные слои с геометрией, в порядке дерева."""
     return [lyr for lyr in project.layerTreeRoot().checkedLayers()
@@ -166,11 +180,15 @@ class DxfAttrExportPlugin:
                           "СК добавлена в «Пользовательские СК» QGIS. Другую можно выбрать "
                           "в окне.".format(name), problem)
         import processing
-        processing.execAlgorithmDialog(ALGORITHM_ID, {
+        parameters = {
             "LAYERS": [QgsProcessingParameterDxfLayers.layerAsVariantMap(QgsDxfExport.DxfLayer(lyr))
                        for lyr in layers],
             "CRS": crs,
-        })
+        }
+        output = default_output(project)
+        if output:
+            parameters["OUTPUT"] = output
+        processing.execAlgorithmDialog(ALGORITHM_ID, parameters)
 
     def ask_crs(self):
         """СК для окна. Запрос уходит в сеть, поэтому показываем песочные часы."""
