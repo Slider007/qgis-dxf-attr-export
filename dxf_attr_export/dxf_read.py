@@ -10,6 +10,7 @@ GDAL разворачивает вставки блоков (INSERT) в их ф�
 """
 
 import codecs
+import re
 
 from .dxf_blocks import python_codec
 
@@ -198,8 +199,17 @@ def _first(tags, code, default=None):
     return default
 
 
+_UNICODE_ESCAPE = re.compile(r"\\U\+([0-9A-Fa-f]{4})")
+
+
+def unescape(text):
+    """«\\U+0422\\U+0435» → «Те». Так AutoCAD (и GDAL) пишут в DXF символы, которых нет в
+    кодовой странице файла: кириллицу в чертеже с кодовой страницей ANSI_1252 и т. п."""
+    return _UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text or "")
+
+
 def _attrib_value(tags):
     """Значение атрибута: куски кода 3 плюс код 1."""
     chunks = [v for c, v in tags if c == _CHUNK_CODE]
     last = [v for c, v in tags if c == _VALUE_CODE]
-    return "".join(chunks) + (last[0] if last else "")
+    return unescape("".join(chunks) + (last[0] if last else ""))

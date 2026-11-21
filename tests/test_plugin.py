@@ -810,6 +810,63 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(got["Дороги (линии)"]["rows"][0]["wkt"],
                          "MULTILINESTRING ((0 200,100 220))")
 
+    def test_dialog_opens_large_enough(self):
+        """Окно алгоритма открывается не крошечным (в QGIS 4 было 636×349)."""
+        import processing as processing_module
+        from dxf_attr_export.plugin import IMPORT_ALGORITHM_ID, open_algorithm_dialog
+        sizes = []
+        original = processing_module.createAlgorithmDialog
+
+        def create(alg, params):
+            dialog = original(alg, params)
+
+            def fake_exec():  # как настоящий: показ (с восстановлением размера QGIS) и события
+                dialog.resize(636, 349)  # так QGIS 4 восстанавливал окно при показе
+                dialog.show()
+                for _ in range(5):
+                    app.processEvents()
+                sizes.append((dialog.width(), dialog.height()))
+            dialog.exec = fake_exec
+            return dialog
+        from processing.tools import general
+        processing_module.createAlgorithmDialog = create
+        was, general.iface = general.iface, Iface()  # окну алгоритма нужно главное окно
+        try:
+            open_algorithm_dialog(IMPORT_ALGORITHM_ID, {})
+        finally:
+            processing_module.createAlgorithmDialog = original
+            general.iface = was
+        free = app.primaryScreen().availableGeometry()
+        self.assertGreaterEqual(sizes[0][0], min(900, free.width() - 40))
+        self.assertGreaterEqual(sizes[0][1], min(680, free.height() - 60))
+
+    def test_unicode_escapes_decoded(self):
+        """«\\U+0422…» в имени слоя и в тексте — это кириллица (так пишут AutoCAD и GDAL вне кодовой страницы)."""
+        esc = "\\U+0422\\U+0435\\U+0441\\U+0442"
+        path = write_dxf("imp_esc.dxf", tag_poly("100", esc, SQUARE) + tag_text("102", "П", 50, 50, esc + "-1"))
+        got = self.run_import("imp_esc.gpkg", path=path)
+        self.assertIn("Тест (полигоны)", got)
+        self.assertEqual(got["Тест (полигоны)"]["rows"][0]["text"], "Тест-1")
+
+    def test_reimport_into_gpkg_of_other_gdal(self):
+        """Повторный импорт в файл, где триггеры индекса другие (файл из QGIS 4, импорт в 3.40)."""
+        import sqlite3
+
+        out = os.path.join(OUT, "imp_again.gpkg")
+        self.run_import("imp_again.gpkg")
+        con = sqlite3.connect(out)
+        for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE '%geom_update%'").fetchall():
+            con.execute('DROP TRIGGER "{}"'.format(name))  # как в новых GDAL: update1…4 нет
+        con.execute("CREATE TABLE чужой (id INTEGER)")  # не наш слой не трогается
+        con.commit()
+        con.close()
+        got = self.run_import("imp_again.gpkg")
+        self.assertEqual(sorted(got), ["Границы (полигоны)", "Дороги (линии)", "Опоры (полигоны)", "чужой"])
+        self.assertEqual(len(got["Границы (полигоны)"]["rows"]), 1)
+        con = sqlite3.connect(out)
+        self.assertTrue(con.execute("SELECT 1 FROM sqlite_master WHERE name='чужой'").fetchone())
+        con.close()
+
     def test_block_attributes_become_fields(self):
         """Атрибуты блока — поля таблицы, а не отдельные подписи."""
         got = self.run_import("imp_attrs.gpkg")["Опоры (полигоны)"]
@@ -1197,6 +1254,7 @@ class MskPrefillTest(unittest.TestCase):
         self.assertNotEqual(QgsNetworkAccessManager.timeout(), LOOKUP_TIMEOUT,
                             "общий таймаут сети трогать не нужно")
 
+
     def test_both_windows_open_with_msk(self):
         """И выгрузка, и чтение открываются с подставленной МСК."""
         import processing as processing_module
@@ -1208,13 +1266,13 @@ class MskPrefillTest(unittest.TestCase):
         plugin = dxf_attr_export.classFactory(iface)
         plugin.initGui()
         opened = []
-        original = processing_module.execAlgorithmDialog
-        processing_module.execAlgorithmDialog = lambda alg, params: opened.append((alg, params))
+        original = processing_module.createAlgorithmDialog
+        processing_module.createAlgorithmDialog = lambda alg, params: opened.append((alg, params))
         try:
             plugin.run()
             plugin.run_import()
         finally:
-            processing_module.execAlgorithmDialog = original
+            processing_module.createAlgorithmDialog = original
             plugin.unload()
             app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.assertEqual([alg for alg, _ in opened], [ALGORITHM_ID, IMPORT_ALGORITHM_ID])
@@ -1475,12 +1533,12 @@ class DefaultFileTest(unittest.TestCase):
         plugin = dxf_attr_export.classFactory(iface)
         plugin.initGui()
         opened = []
-        original = processing_module.execAlgorithmDialog
-        processing_module.execAlgorithmDialog = lambda alg, params: opened.append(params)
+        original = processing_module.createAlgorithmDialog
+        processing_module.createAlgorithmDialog = lambda alg, params: opened.append(params)
         try:
             plugin.run()
         finally:
-            processing_module.execAlgorithmDialog = original
+            processing_module.createAlgorithmDialog = original
             plugin.unload()
             app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             project.setFileName(was_file)

@@ -12,7 +12,7 @@ from qgis.core import (
     QgsProject,
     QgsVectorLayer,
 )
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtGui import QCursor, QIcon
 from qgis.PyQt.QtWidgets import QApplication, QMenu, QToolButton
 
@@ -111,6 +111,37 @@ def visible_vector_layers(project):
             if isinstance(lyr, QgsVectorLayer) and lyr.isSpatial()]
 
 
+
+DIALOG_SIZE = (900, 680)
+
+
+def grow(widget):
+    # в QGIS 4 окно алгоритма — виджет, который exec() кладёт в свой QDialog: менять размер его
+    dialog = widget.window()
+    width, height = DIALOG_SIZE
+    screen = dialog.screen() if hasattr(dialog, "screen") else None
+    if screen is not None:
+        free = screen.availableGeometry()
+        width, height = min(width, free.width() - 40), min(height, free.height() - 60)
+    dialog.resize(max(width, dialog.width()), max(height, dialog.height()))
+
+
+def open_algorithm_dialog(algorithm_id, parameters):
+    """Как processing.execAlgorithmDialog, но окно сразу удобного размера: в QGIS 4 оно
+    открывалось 636×349 — параметры и справка в прокрутке, «Система координат» обрезана."""
+    import processing
+
+    dialog = processing.createAlgorithmDialog(algorithm_id, parameters)
+    if dialog is None:
+        return {}
+    # увеличить уже после показа: при показе QGIS восстанавливает сохранённый размер окна
+    # и затирает resize, сделанный до exec(). Больший размер, выбранный человеком, не трогаем.
+    QTimer.singleShot(0, lambda: grow(dialog))
+    dialog.exec()
+    results = dialog.results()
+    dialog.close()  # Esc только прячет окно
+    return results
+
 class DxfAttrExportPlugin:
     def __init__(self, iface):
         self.iface = iface
@@ -179,7 +210,6 @@ class DxfAttrExportPlugin:
         self.say(name and "Координаты DXF будут записаны в «{}» — определено по центру карты, "
                           "СК добавлена в «Пользовательские СК» QGIS. Другую можно выбрать "
                           "в окне.".format(name), problem)
-        import processing
         parameters = {
             "LAYERS": [QgsProcessingParameterDxfLayers.layerAsVariantMap(QgsDxfExport.DxfLayer(lyr))
                        for lyr in layers],
@@ -188,7 +218,7 @@ class DxfAttrExportPlugin:
         output = default_output(project)
         if output:
             parameters["OUTPUT"] = output
-        processing.execAlgorithmDialog(ALGORITHM_ID, parameters)
+        open_algorithm_dialog(ALGORITHM_ID, parameters)
 
     def ask_crs(self):
         """СК для окна. Запрос уходит в сеть, поэтому показываем песочные часы."""
@@ -228,5 +258,4 @@ class DxfAttrExportPlugin:
         self.say(name and "Система координат чертежа: «{}» — определено по центру карты, "
                           "СК добавлена в «Пользовательские СК» QGIS. Если чертёж в другой, "
                           "выберите её в окне.".format(name), problem)
-        import processing
-        processing.execAlgorithmDialog(IMPORT_ALGORITHM_ID, {"CRS": crs})
+        open_algorithm_dialog(IMPORT_ALGORITHM_ID, {"CRS": crs})

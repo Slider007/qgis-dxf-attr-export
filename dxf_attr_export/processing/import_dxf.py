@@ -190,6 +190,45 @@ def layer_name(dxf_layer, kind):
     return "{} ({})".format(base, kind)
 
 
+def drop_layers(path, names):
+    """Убрать из существующего GeoPackage слои с этими именами.
+
+    Не через OVERWRITE=YES в GDAL: GDAL 3.3 (QGIS 3.40) удаляет триггеры пространственного
+    индекса поимённо (…_geom_update1…4), а GDAL в QGIS 4 их создаёт иначе (…_update6/7) —
+    повторный импорт в файл из QGIS 4 падал с «no such trigger». Здесь — DROP … IF EXISTS.
+    """
+    import sqlite3
+
+    try:
+        con = sqlite3.connect(path, timeout=5)
+    except sqlite3.Error:
+        return  # не SQLite — create_output скажет, что это не GeoPackage
+    try:
+        cur = con.cursor()
+        tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "gpkg_contents" not in tables:
+            return
+        existing = {r[0] for r in cur.execute("SELECT table_name FROM gpkg_contents")}
+        q = lambda n: '"{}"'.format(n.replace('"', '""'))  # noqa: E731
+        for name in names & existing:
+            for (trigger,) in cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?", (name,)).fetchall():
+                cur.execute("DROP TRIGGER IF EXISTS " + q(trigger))
+            cur.execute("DROP TABLE IF EXISTS " + q("rtree_{}_geom".format(name)))
+            cur.execute("DROP TABLE IF EXISTS " + q(name))
+            for table in ("gpkg_contents", "gpkg_geometry_columns", "gpkg_extensions",
+                          "gpkg_ogr_contents", "gpkg_data_columns"):
+                if table in tables:
+                    cur.execute("DELETE FROM {} WHERE table_name=?".format(table), (name,))
+        con.commit()
+    except sqlite3.OperationalError as e:
+        raise QgsProcessingException(QCoreApplication.translate(
+            "ImportDxf", "Не удалось заменить слои в «{}»: {}. Если файл открыт в QGIS или другой "
+            "программе — закройте его или укажите другой файл").format(os.path.basename(path), e))
+    finally:
+        con.close()
+
+
 def free_name(name, used):
     """Имя слоя, которого ещё нет: совпадения разводятся номером."""
     out, n = name, 2
@@ -516,13 +555,13 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             if geom is None or geom.IsEmpty():
                 continue
             extent.add(geom.GetEnvelope())
-            dxf_layer = feature.GetFieldAsString("Layer")
+            dxf_layer = dxf_read.unescape(feature.GetFieldAsString("Layer"))
             if is_label(sub, handle, marks[1]):
                 if label_mode == NO_LABELS:
                     continue
                 point = geom.GetPoint(0)
                 labels.append((QgsPointXY(point[0], point[1]),
-                               feature.GetFieldAsString("Text"), dxf_layer, handle))
+                               dxf_read.unescape(feature.GetFieldAsString("Text")), dxf_layer, handle))
                 continue
             info = attrs.get(handle)
             for kind, parts in split_by_kind(ogr, geom, closed).items():
@@ -599,6 +638,13 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             bound = self.bindings(ogr, layer, index, label_rows, marks, closed, feedback)
         if feedback.isCanceled():
             return []  # отменили на привязке — файл не создаём
+        # слои, которые сейчас запишем, убираются из старого файла заранее (см. drop_layers)
+        planned = set()
+        for key in sorted(groups, key=lambda k: groups[k].name):
+            free_name(groups[key].name, planned)
+        free_name(layer_name("Подписи", POINT), planned)
+        if os.path.exists(out_path):
+            drop_layers(out_path, planned)
         out_ds, srs = self.create_output(gdal, ogr, osr, out_path, crs, feedback)
         types = ogr_types(ogr)
         names = []
@@ -610,7 +656,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             flat, with_z = types[group.kind]
             group.layer = out_ds.CreateLayer(
                 group.name, srs, with_z if group.has_z else flat,
-                ["GEOMETRY_NAME=geom", "SPATIAL_INDEX=YES", "OVERWRITE=YES"])
+                ["GEOMETRY_NAME=geom", "SPATIAL_INDEX=YES"])
             if group.layer is None:
                 raise QgsProcessingException(
                     self.tr("Слой «{}» не создался в GeoPackage — возможно, файл открыт в другой программе. Закройте его и повторите").format(group.name))
@@ -634,11 +680,11 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
             geom = feature.GetGeometryRef()
             if geom is None or geom.IsEmpty():
                 continue
-            dxf_layer = feature.GetFieldAsString("Layer")
+            dxf_layer = dxf_read.unescape(feature.GetFieldAsString("Layer"))
             info = attrs.get(handle)
             entity = entity_name(sub)
             # у штриховки в поле Text GDAL держит имя узора, а не подпись
-            own_text = "" if entity == "HATCH" else feature.GetFieldAsString("Text")
+            own_text = "" if entity == "HATCH" else dxf_read.unescape(feature.GetFieldAsString("Text"))
             for kind, parts in split_by_kind(ogr, geom, closed).items():
                 group = self.group_for(groups, dxf_layer, kind, split, create=False)
                 if group is None or group.layer is None:
@@ -787,7 +833,7 @@ class ImportDxfAlgorithm(QgsProcessingAlgorithm):
         """Подписи, не попавшие ни в один полигон, — отдельным слоем точек."""
         name = free_name(layer_name("Подписи", POINT), used)
         layer = out_ds.CreateLayer(name, srs, ogr.wkbPoint,
-                                   ["GEOMETRY_NAME=geom", "SPATIAL_INDEX=YES", "OVERWRITE=YES"])
+                                   ["GEOMETRY_NAME=geom", "SPATIAL_INDEX=YES"])
         if layer is None:
             raise QgsProcessingException(
                 self.tr("Слой «{}» не создался в GeoPackage — возможно, файл открыт в другой программе. Закройте его и повторите").format(name))
